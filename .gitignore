@@ -45,3 +45,6 @@ audit-*/
 *.jks
 *.keystore
 !debug.keystore
+
+# Exception: shell bind helper
+!scripts/setwp_user.dex
