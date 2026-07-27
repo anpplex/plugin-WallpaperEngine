@@ -16,9 +16,21 @@
 2. 若引擎未激活 → `Intent(CHANGE_LIVE_WALLPAPER)`  
 3. 华为/阿维塔 HU **无标准 Live Wallpaper 设置页** → 异常 → 弹窗  
 
-## 修复（本仓已提供脚本）
+## 修复（本仓已提供）
 
-### 立刻上主屏（推荐）
+### 1) 官方补丁（已装车）
+
+`Util.callApplyWallpaper`：`CHANGE_LIVE_WALLPAPER` 失败时 **不再弹错误窗**，改为 Toast「壁纸已应用」  
+（`selectedWallpaper` 已写入；主屏仍需 shell 绑定一次）。
+
+重建/重装：
+
+```bash
+./we-official/scripts/build-and-install-patched.sh LD249H019625
+./scripts/we-bind-only.sh LD249H019625 12
+```
+
+### 2) 立刻上主屏（shell）
 
 ```bash
 cd /Users/anpple/Codex/WallpaperEngine
@@ -36,15 +48,16 @@ cd /Users/anpple/Codex/WallpaperEngine
 mWallpaperComponent=…io.wallpaperengine.weclient/.WEWallpaperService
 ```
 
-### 冷启动丢失（CB-FAIL）
-
-今天实测重启后会变成 Motif 视频壁纸。开机后：
+### 3) 冷启动丢失（CB-FAIL）→ Mac 自动重绑
 
 ```bash
+# 一次性
 ./scripts/we-boot-rebind.sh LD249H019625 12
-```
 
-可挂 Mac LaunchAgent（设备上线自动跑），与 Motif 自持同思路。
+# 常驻：Mac 登录后 watch ADB 上线自动 rebind
+./scripts/install-mac-we-watch.sh LD249H019625 12
+# 日志: ~/Library/Logs/we-car/watch.log
+```
 
 ## 产品侧原则
 

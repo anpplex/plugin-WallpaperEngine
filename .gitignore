@@ -23,7 +23,9 @@ we-official/**/apktool-out/
 we-official/**/*.apk
 we-official/**/lib/
 we-official/**/wallpaper-engine.apk
+we-official/dist/
 sandbox/
+audit-*/
 
 # Large sample wallpapers (place under app/src/main/assets/we_packs/ locally)
 app/src/main/assets/we_packs/*.mpkg

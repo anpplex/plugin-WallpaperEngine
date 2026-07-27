@@ -10,8 +10,11 @@
 | `hint_import_file_pc` | 扫码上传说明 |
 | `btn_import_file_local` | **文案不变**「导入文件」 |
 | `ImportFileFragment` | 两按钮跳转 `com.motif.wallpaperengine/.MainActivity`（`we_mode=qr` / `scan`） |
+| `Util.callApplyWallpaper` | CHANGE_LIVE_WALLPAPER 失败 → Toast 已应用（**不弹错误**），prefs 已写 |
 | `queries` | 声明 Motif 壳包名 |
 | `extractNativeLibs` | 补丁重打包时 `true`（apktool 对齐） |
+
+参考 smali：`reference/ImportFileFragment.smali`、`reference/Util_Companion.smali`
 
 ## 本地重建
 
