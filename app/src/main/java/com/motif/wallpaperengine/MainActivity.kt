@@ -50,8 +50,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import android.util.Log
 import com.motif.wallpaperengine.importscan.WeLibrarySync
 import com.motif.wallpaperengine.importscan.WeMpkgDelivery
+import com.motif.wallpaperengine.importscan.WeOfficialApply
 import com.motif.wallpaperengine.importscan.WePackageScan
 import com.motif.wallpaperengine.importscan.WeReceiveServer
 import kotlinx.coroutines.Dispatchers
@@ -81,13 +83,32 @@ class MainActivity : ComponentActivity() {
                         onRequestStorage = { ensureStorageAccess() },
                         onImportOne = { c ->
                             val o = WeLibrarySync.importOne(this, c, openPreview = true, forceRestartWe = true)
-                            Toast.makeText(this, o.message, Toast.LENGTH_SHORT).show()
+                            if (o.ok) {
+                                WeOfficialApply.afterImport(this, c.file.name, openLibrary = false)
+                                Log.i("WeApply", WeOfficialApply.applyShellHint(c.file.name))
+                                Toast.makeText(
+                                    this,
+                                    WeOfficialApply.toastAfterImport(c.file.name),
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            } else {
+                                Toast.makeText(this, o.message, Toast.LENGTH_SHORT).show()
+                            }
                             o.ok
                         },
                         onImportAll = { list, onProgress ->
-                            WeLibrarySync.importAll(this, list, onProgress)
+                            val result = WeLibrarySync.importAll(this, list, onProgress)
+                            list.lastOrNull()?.let {
+                                WeOfficialApply.afterImport(this, it.file.name, openLibrary = false)
+                            }
+                            result
                         },
                         onOpenLibrary = { WeLibrarySync.openWeLibrary(this) },
+                        onApplyShellHint = {
+                            WeOfficialApply.pendingRelPath(this)?.let { rel ->
+                                WeOfficialApply.applyShellHintRel(rel)
+                            } ?: WeOfficialApply.applyShellHintRel("downloads/YOUR.mpkg")
+                        },
                         onStartReceive = { onFile ->
                             if (receiveServer?.isRunning() != true) {
                                 receiveServer = WeReceiveServer(this) { f ->
@@ -141,14 +162,37 @@ class MainActivity : ComponentActivity() {
                         sourceHint = "adb",
                     )
                     val o = WeLibrarySync.importOne(this, c, forceRestartWe = true)
-                    Toast.makeText(this, o.message, Toast.LENGTH_LONG).show()
+                    if (o.ok) {
+                        WeOfficialApply.afterImport(this, file.name)
+                        Log.i("WeApply", WeOfficialApply.applyShellHint(file.name))
+                    }
+                    Toast.makeText(
+                        this,
+                        if (o.ok) WeOfficialApply.toastAfterImport(file.name) else o.message,
+                        Toast.LENGTH_LONG,
+                    ).show()
                 }
             }
             !intent?.getStringExtra("import_asset").isNullOrBlank() -> {
                 val asset = intent.getStringExtra("import_asset")!!
                 window.decorView.post {
                     val r = WeMpkgDelivery.deliverAsset(this, asset)
+                    val name = asset.substringAfterLast('/')
+                    if (r.ok) {
+                        WeOfficialApply.afterImport(this, name)
+                        Log.i("WeApply", WeOfficialApply.applyShellHint(name))
+                    }
                     Toast.makeText(this, r.message, Toast.LENGTH_SHORT).show()
+                }
+            }
+            !intent?.getStringExtra("apply_rel").isNullOrBlank() -> {
+                // adb: --es apply_rel downloads/75681.mpkg → 仅记录并 log 命令（shell 在 Mac 执行）
+                val rel = intent.getStringExtra("apply_rel")!!
+                window.decorView.post {
+                    WeOfficialApply.rememberPending(this, rel.removePrefix("downloads/"))
+                    val hint = WeOfficialApply.applyShellHintRel(rel)
+                    Log.i("WeApply", hint)
+                    Toast.makeText(this, "Apply 命令已写 logcat WeApply", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -195,6 +239,7 @@ private fun WeAddScreen(
     onStartReceive: ((File) -> Unit) -> List<String>,
     onStopReceive: () -> Unit,
     isImported: (String, Long) -> Boolean,
+    onApplyShellHint: () -> String,
 ) {
     var screen by remember {
         mutableStateOf(
@@ -274,6 +319,11 @@ private fun WeAddScreen(
                 onQr = { screen = "qr" },
                 onScan = { screen = "scan" },
                 onOpenLibrary = onOpenLibrary,
+                onShowApplyHint = {
+                    status = onApplyShellHint().lines().firstOrNull() ?: status
+                    // full multi-line into status bar truncated; user sees Logcat WeApply
+                    android.util.Log.i("WeApply", onApplyShellHint())
+                },
             )
             "qr" -> QrPanel(
                 urls = qrUrls,
@@ -320,6 +370,7 @@ private fun HomeAddButtons(
     onQr: () -> Unit,
     onScan: () -> Unit,
     onOpenLibrary: () -> Unit,
+    onShowApplyHint: () -> Unit,
 ) {
     Column(
         Modifier
@@ -353,7 +404,7 @@ private fun HomeAddButtons(
             minLines = 2,
         )
         Text(
-            "实际：扫描车机适配目录，入库官方 WE 壁纸库 downloads/",
+            "实际：扫描适配目录 → 入库 downloads/。官方 ✓ 会失败，设主屏用 shell。",
             color = Color(0xFF666666),
             fontSize = 12.sp,
             textAlign = TextAlign.Center,
@@ -363,6 +414,16 @@ private fun HomeAddButtons(
         TextButton(onClick = onOpenLibrary) {
             Text("打开官方 WE 壁纸库", color = WeBlue)
         }
+        TextButton(onClick = onShowApplyHint) {
+            Text("设主屏命令（绕过「不支持动态壁纸」）", color = WeBlueDark)
+        }
+        Text(
+            "Mac: ./scripts/we-apply-shell.sh <serial> downloads/xxx.mpkg 12",
+            color = Color.Gray,
+            fontSize = 11.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.widthIn(max = 440.dp),
+        )
     }
 }
 

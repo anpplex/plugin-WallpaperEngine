@@ -57,10 +57,27 @@ bash scripts/install-car.sh LD249H019625
 | 扫码导入 | HTTP 接收 → 适配目录 |
 | 导入文件 | 扫 Download / motif_live/we / U 盘 / we_import（文案保持「导入文件」） |
 | 入库联动 | FileProvider VIEW → 官方 WE `files/downloads/` 壁纸库 |
+| **设主屏（修弹窗）** | **不要点官方 ✓**；用 `scripts/we-apply-shell.sh` / `we-bind-only.sh` |
+| 开机重绑 | `scripts/we-boot-rebind.sh`（对抗 CB-FAIL） |
 | 官方补丁 | 添加页「扫码导入」+ 跳转本壳（见 `we-official/`） |
+
+### 官方 ✓ 弹「不支持动态壁纸」
+
+```bash
+# 入库后设主屏（示例）
+./scripts/we-apply-shell.sh LD249H019625 downloads/75681.mpkg 12
+# 或仅绑定（已点过 ✓ / 无 root）
+./scripts/we-bind-only.sh LD249H019625 12
+# 重启后
+./scripts/we-boot-rebind.sh LD249H019625 12
+```
+
+详见 `docs/car/官方WE-应用壁纸弹窗修复.md`。
 
 ## 相关文档
 
+- `docs/car/官方WE-应用壁纸弹窗修复.md` — **Apply 弹窗修复**
+- `docs/car/官方WE-底部三Tab车机审计.md`
 - `docs/car/WE-车机内容导入适配.md`
 - `docs/car/WE子项目-华为车机适配与合并策略.md`
 - `docs/superpowers/specs/` — 设计规格

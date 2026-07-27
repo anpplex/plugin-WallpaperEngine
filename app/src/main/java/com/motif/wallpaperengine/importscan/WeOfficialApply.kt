@@ -89,10 +89,28 @@ object WeOfficialApply {
 
     fun applyShellHint(fileName: String): String {
         val rel = officialRelPath(fileName)
-        return """
-            # 车机 shell 应用（root/shell 写官方 prefs + 绑定）
-            # selectedWallpaper=$rel
-            bash scripts/we-apply-shell.sh <serial> $rel
-        """.trimIndent()
+        return applyShellHintRel(rel)
+    }
+
+    fun applyShellHintRel(relPath: String): String {
+        val rel = if (relPath.startsWith(WE_DOWNLOAD_REL)) {
+            relPath
+        } else {
+            officialRelPath(relPath)
+        }
+        return buildString {
+            appendLine("官方 ✓ 会弹「不支持动态壁纸」— 请用 shell 应用：")
+            appendLine("./scripts/we-apply-shell.sh <serial> $rel 12")
+            appendLine("# 若已点过 ✓ 或无 root：")
+            appendLine("./scripts/we-bind-only.sh <serial> 12")
+            appendLine("# 重启后若丢失：")
+            append("./scripts/we-boot-rebind.sh <serial> 12")
+        }
+    }
+
+    /** 入库成功后的用户可见提示（Toast 可截断，完整进 Log） */
+    fun toastAfterImport(fileName: String): String {
+        val rel = officialRelPath(fileName)
+        return "已入库 $fileName。设主屏请 Mac 执行: we-apply-shell.sh … $rel"
     }
 }
