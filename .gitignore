@@ -1,0 +1,47 @@
+# Build
+**/build/
+.gradle/
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+
+# Worktrees
+.worktrees/
+worktrees/
+
+# Official WE binaries (rebuild locally; do not commit)
+we-official/**/apktool-out/
+we-official/**/*.apk
+we-official/**/lib/
+we-official/**/wallpaper-engine.apk
+sandbox/
+
+# Large sample wallpapers (place under app/src/main/assets/we_packs/ locally)
+app/src/main/assets/we_packs/*.mpkg
+app/testdata/**/*.mpkg
+app/testdata/**/*.tex
+*.mpkg
+
+# Tools / python
+**/__pycache__/
+*.pyc
+app/tools/**/bin/
+*.so
+
+# Logs / audits
+audit-*/
+*.log
+
+# Keys
+*.jks
+*.keystore
+!debug.keystore

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Motif WE</string>
+    <string name="wallpaper_label">Motif WE Wallpaper</string>
+    <string name="home_title">Wallpaper Engine · 车机适配</string>
+    <string name="home_subtitle">扫库添加 · 华为分享/任意端落盘后扫描即可</string>
+    <string name="status_placeholder">扫描 Download / motif_live/we / U 盘 / we_import</string>
+    <string name="btn_open_official">打开已装官方 WE（若存在）</string>
+    <string name="btn_scan_hint">导入走扫库，不依赖系统文件选择器</string>
+</resources>

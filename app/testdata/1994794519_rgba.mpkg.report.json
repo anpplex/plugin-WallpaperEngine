@@ -1,0 +1,29 @@
+{
+  "source": "/Users/anpple/Downloads/1994794519",
+  "mode": "rgba",
+  "reencoded": [
+    {
+      "path": "materials/DVA壁纸-4kH.tex",
+      "from": "fmt=0 4096x2048",
+      "to_size": 6353504,
+      "mode": "rgba"
+    },
+    {
+      "path": "materials/masks/pulse_mask_843377ec5689457129ad9ee2dd9c051f084db05d.tex",
+      "from": "fmt=0 2048x1024",
+      "to_size": 127376,
+      "mode": "rgba"
+    },
+    {
+      "path": "materials/DVA壁纸-4kH2.tex",
+      "from": "fmt=0 4096x2048",
+      "to_size": 6353415,
+      "mode": "rgba"
+    }
+  ],
+  "kept": [],
+  "failed": [],
+  "output": "/Users/anpple/Codex/Motif/WallpaperEngine/testdata/1994794519_rgba.mpkg",
+  "output_bytes": 13090774,
+  "magic": "PKGM0019"
+}

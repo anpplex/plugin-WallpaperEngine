@@ -1,0 +1,137 @@
+{
+	"camera" : 
+	{
+		"center" : "0.000 0.000 -1.000",
+		"eye" : "0.000 0.000 0.000",
+		"up" : "0.000 1.000 0.000"
+	},
+	"general" : 
+	{
+		"ambientcolor" : "0.300 0.300 0.300",
+		"bloom" : true,
+		"bloomstrength" : 0.14000000059604645,
+		"bloomthreshold" : 0.64999997615814209,
+		"camerafade" : true,
+		"cameraparallax" : false,
+		"cameraparallaxamount" : 0.5,
+		"cameraparallaxdelay" : 0.10000000149011612,
+		"cameraparallaxmouseinfluence" : 0.0,
+		"camerapreview" : true,
+		"camerashake" : false,
+		"camerashakeamplitude" : 0.5,
+		"camerashakeroughness" : 1.0,
+		"camerashakespeed" : 3.0,
+		"clearcolor" : "0.700 0.700 0.700",
+		"clearenabled" : true,
+		"farz" : 10000.0,
+		"fov" : 50.0,
+		"nearz" : 0.0099999997764825821,
+		"orthogonalprojection" : 
+		{
+			"height" : 2048,
+			"width" : 4096
+		},
+		"skylightcolor" : "0.300 0.300 0.300"
+	},
+	"objects" : 
+	[
+		{
+			"angles" : "0.000 0.000 0.000",
+			"colorBlendMode" : 0,
+			"copybackground" : true,
+			"effects" : 
+			[
+				{
+					"file" : "effects/pulse/effect.json",
+					"id" : 33,
+					"name" : "",
+					"passes" : 
+					[
+						{
+							"constantshadervalues" : 
+							{
+								"amount" : 0.25,
+								"noiseamount" : 0.29999999999999999,
+								"noisespeed" : 0.26000000000000001,
+								"phase" : 0,
+								"power" : 1,
+								"speed" : 3
+							},
+							"id" : 34,
+							"textures" : 
+							[
+								null,
+								"util/noise",
+								"masks/pulse_mask_843377ec5689457129ad9ee2dd9c051f084db05d"
+							]
+						}
+					],
+					"visible" : true
+				},
+				{
+					"file" : "effects/xray/effect.json",
+					"id" : 50,
+					"name" : "",
+					"passes" : 
+					[
+						{
+							"constantshadervalues" : 
+							{
+								"size" : 0.050000000000000003
+							},
+							"id" : 51,
+							"textures" : [ null, "DVA壁纸-4kH2", "particle/halo_6" ]
+						}
+					],
+					"visible" : true
+				}
+			],
+			"id" : 47,
+			"image" : "models/DVA壁纸-4kH.json",
+			"locktransforms" : false,
+			"name" : "DVA壁纸-4kH",
+			"origin" : "2048.000 1024.000 0.000",
+			"parallaxDepth" : "1.000 1.000",
+			"perspective" : false,
+			"scale" : "1.000 1.000 1.000",
+			"size" : "4096.000 2048.000",
+			"solid" : true,
+			"visible" : true
+		},
+		{
+			"angles" : "0.000 0.000 0.000",
+			"id" : 27,
+			"instanceoverride" : 
+			{
+				"alpha" : 0.55000000000000004,
+				"id" : 28,
+				"size" : 2.2200000000000002
+			},
+			"locktransforms" : false,
+			"name" : "new particle system",
+			"origin" : "1700.000 1150.000 0.000",
+			"parallaxDepth" : "1.000 1.000",
+			"particle" : "particles/new_particle_system.json",
+			"scale" : "1.000 1.000 1.000",
+			"visible" : true
+		},
+		{
+			"angles" : "0.000 0.000 0.000",
+			"id" : 76,
+			"instanceoverride" : 
+			{
+				"alpha" : 0.55000000000000004,
+				"colorn" : "1 0.49019607843137253 0.49019607843137253",
+				"id" : 77,
+				"size" : 2.1200000000000001
+			},
+			"locktransforms" : false,
+			"name" : "new particle system",
+			"origin" : "2550.898 621.564 0.000",
+			"parallaxDepth" : "1.000 1.000",
+			"particle" : "particles/new_particle_system_1.json",
+			"scale" : "1.000 1.000 1.000",
+			"visible" : true
+		}
+	]
+}
