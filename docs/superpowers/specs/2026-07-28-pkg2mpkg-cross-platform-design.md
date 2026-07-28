@@ -308,7 +308,7 @@ ADB Auto 的计算顺序：
 
 alignment_x 和 alignment_y 取值为 0 到 100。50 表示居中；只有存在对应方向的溢出时才生效。Windows 兼容输入中的 videoalignment 在进入核心模型时完成方向映射，避免 UI 与转换器重复反转。
 
-动态 Scene 的目标分辨率不改变场景画布；它只参与纹理预设建议和设备验收。Exact/ADB Auto 的强制像素尺寸用于预渲染 Scene 和 Video 输出。
+动态 Scene 的目标分辨率不改变场景画布；它只参与纹理预设建议和设备验收。预渲染 Scene 和 Video 在 Cover 模式使用 Exact/ADB Auto 的精确像素尺寸，在 KeepAspect 模式则把该尺寸作为最大边界。
 
 ## 9. Scene 动态导出
 
