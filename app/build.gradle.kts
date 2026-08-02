@@ -14,6 +14,21 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0-car"
+        // WP-09: inject Mineradio APK signing cert SHA-256 (not a secret).
+        // Shared parse rule with verify-wallpaper-plugin: 64 hex lowercase; debug zero-digest fallback.
+        val certProp = (project.findProperty("mineradioCallerCertSha256") as String?)
+            ?: System.getenv("MINERADIO_CALLER_CERT_SHA256")
+        val certTrim = certProp?.trim()?.lowercase()
+        require(certTrim == null || certTrim.isEmpty() || certTrim.matches(Regex("^[0-9a-f]{64}$"))) {
+            "mineradioCallerCertSha256 must be empty (dev) or 64 hex"
+        }
+        val certSha = if (certTrim != null && certTrim.matches(Regex("^[0-9a-f]{64}$"))) {
+            certTrim
+        } else {
+            "0".repeat(64)
+        }
+        buildConfigField("String", "MINERADIO_CALLER_CERT_SHA256", "\"$certSha\"")
+        manifestPlaceholders["mineradioCallerCertSha256"] = certSha
         buildConfigField("String", "WE_OFFICIAL_PKG", "\"io.wallpaperengine.weclient\"")
         buildConfigField(
             "String",

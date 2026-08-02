@@ -33,6 +33,11 @@
         android:requestLegacyExternalStorage="true"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <!-- WP-09: Mineradio signing certificate SHA-256 allowlist (static verifier). -->
+        <meta-data
+            android:name="mineradioCallerCertSha256"
+            android:value="${mineradioCallerCertSha256}" />
+
 
         <provider
             android:name="androidx.core.content.FileProvider"
