@@ -22,6 +22,33 @@ class PluginOperationLedgerTest {
     }
 
     @Test
+    fun importRecordsBinderCallerIdentityNotRequestForged() {
+        val ledger = PluginOperationLedger()
+        val rec = ledger.beginImport(
+            operationId = "op-caller",
+            sourceUri = "content://src/c",
+            displayName = "c.mpkg",
+            callerPackage = "com.mineradio.app",
+            callerUid = 10244,
+            certAllowlistMatch = true,
+        )
+        assertEquals("com.mineradio.app", rec.callerPackage)
+        assertEquals(10244, rec.callerUid)
+        assertTrue(rec.certAllowlistMatch)
+
+        val shellRec = ledger.beginImport(
+            operationId = "op-shell",
+            sourceUri = "content://src/s",
+            displayName = "s.mpkg",
+            callerPackage = "shell",
+            callerUid = CallerPolicy.SHELL_UID,
+            certAllowlistMatch = false,
+        )
+        assertEquals("shell", shellRec.callerPackage)
+        assertFalse(shellRec.certAllowlistMatch)
+    }
+
+    @Test
     fun confirmConsumesTokenOnceAndSetsSourceConsumed() {
         val ledger = PluginOperationLedger()
         val rec = ledger.beginImport("op-2", "content://src/2", "demo.mpkg")

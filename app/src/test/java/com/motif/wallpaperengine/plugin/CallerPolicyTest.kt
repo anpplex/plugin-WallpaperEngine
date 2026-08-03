@@ -97,6 +97,19 @@ class CallerPolicyTest {
         assertFalse(policy.evaluate(42).allowed)
     }
 
+    @Test
+    fun allowReasonIsStrictTokenForCertAllowlistStamp() {
+        // PluginControlProvider.CallerStamp treats reason=="ALLOW" as cert match.
+        val policy = policy(
+            identities = listOf(
+                CallerPolicy.PackageIdentity("com.mineradio.app", goodCert),
+            ),
+        )
+        assertEquals("ALLOW", policy.evaluate(10001).reason)
+        assertEquals("SHELL_DEBUG", policy(isDebug = true, identities = emptyList())
+            .evaluate(CallerPolicy.SHELL_UID).reason)
+    }
+
     private fun policy(
         identities: List<CallerPolicy.PackageIdentity>,
         isDebug: Boolean = true,

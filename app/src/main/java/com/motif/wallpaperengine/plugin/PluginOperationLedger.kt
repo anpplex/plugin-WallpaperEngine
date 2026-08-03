@@ -20,6 +20,11 @@ class PluginOperationLedger {
         var sourceConsumed: Boolean,
         var tokenConsumed: Boolean,
         var displayName: String?,
+        /** Package that opened the import (from Binder CallerPolicy, not request extras). */
+        val callerPackage: String?,
+        val callerUid: Int,
+        /** True only when package+cert allowlist hit (never true for shell debug). */
+        val certAllowlistMatch: Boolean,
     )
 
     private val records = ConcurrentHashMap<String, Record>()
@@ -30,6 +35,9 @@ class PluginOperationLedger {
         operationId: String,
         sourceUri: String?,
         displayName: String?,
+        callerPackage: String? = null,
+        callerUid: Int = -1,
+        certAllowlistMatch: Boolean = false,
     ): Record {
         val epoch = 1
         val token = UUID.randomUUID().toString()
@@ -44,6 +52,9 @@ class PluginOperationLedger {
             sourceConsumed = false,
             tokenConsumed = false,
             displayName = displayName,
+            callerPackage = callerPackage,
+            callerUid = callerUid,
+            certAllowlistMatch = certAllowlistMatch,
         )
         records[operationId] = rec
         return rec
