@@ -48,6 +48,11 @@ class PluginRuntimeState {
     var targetComponent: String? = null
         private set
 
+    /** Last getWallpaperInfo component (package/class flatten); for E5 status surface. */
+    @Volatile
+    var lastObservedComponent: String? = null
+        private set
+
     @Volatile
     var actionEpoch: Int = 0
         private set
@@ -115,6 +120,7 @@ class PluginRuntimeState {
         // Marker for capacity contracts: getWallpaperInfo
         synchronized(lock) {
             targetComponent = target
+            lastObservedComponent = component
             // Single mapping shared with WallpaperBindingReconciler.mapComponentToBinding
             bindingState = WallpaperBindingReconciler.mapComponentToBinding(component, target)
         }

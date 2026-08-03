@@ -120,6 +120,17 @@ class PluginControlProvider : ContentProvider() {
         out.putBoolean(PluginContract.KEY_CERT_ALLOWLIST_MATCH, caller.certAllowlistMatch)
     }
 
+    /** Project last observed wallpaper component from getWallpaperInfo (E5). */
+    private fun attachActiveWallpaper(out: Bundle, runtime: PluginProcessRuntime) {
+        val component = runtime.state.lastObservedComponent
+        if (!component.isNullOrBlank()) {
+            out.putString(PluginContract.KEY_ACTIVE_COMPONENT, component)
+            val slash = component.indexOf('/')
+            val pkg = if (slash > 0) component.substring(0, slash) else component
+            out.putString(PluginContract.KEY_ACTIVE_PACKAGE, pkg)
+        }
+    }
+
     private fun handlePing(): Bundle {
         return okBundle().apply {
             putInt(PluginContract.KEY_RUNTIME_PID, Process.myPid())
@@ -135,6 +146,8 @@ class PluginControlProvider : ContentProvider() {
         }
         val out = okBundle()
         out.putInt(PluginContract.KEY_RUNTIME_PID, Process.myPid())
+        // E5: expose last getWallpaperInfo component (public API), never dumpsys-driven.
+        attachActiveWallpaper(out, runtime)
         if (operationId.isNullOrBlank()) {
             out.putString(PluginContract.KEY_OPERATION_STATE, runtime.snapshotOperationState())
             out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
