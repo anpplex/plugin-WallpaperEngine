@@ -5,80 +5,203 @@ import android.content.ContentValues
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import android.os.Process
 
 /**
- * WP-08 ContentProvider control surface (protocol 1 authority).
+ * Protocol-1 control Provider on process `:we_runtime`.
  *
- * REFACTOR: uses [PluginProcessRuntime] only — no private RuntimeState/Queue.
- * status always re-reconciles via [WallpaperBindingReconciler] when Context available.
- *
- * Methods: apply_current, next, previous, stop, status.
+ * WP-08 queue/apply surface + WP-10A ping / import_mpkg / renew_action (actionToken).
+ * Uses [PluginProcessRuntime] + [PluginOperationLedger]; no second binding truth.
  */
 class PluginControlProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
         val runtime = PluginProcessRuntime
-        val out = Bundle()
-        out.putInt(PluginContract.KEY_PROTOCOL_VERSION, PluginContract.PROTOCOL_VERSION)
+        val request = extras ?: Bundle()
+        // Force unparcel before reads.
+        request.size()
 
-        when (method) {
-            PluginContract.METHOD_APPLY_CURRENT,
-            "apply_current",
-            -> {
-                // code=20 + PendingIntent → PluginActionActivity →
-                // WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER + EXTRA_LIVE_WALLPAPER_COMPONENT
-                // claimLaunch serializes concurrent UI.
-                val fromOp = extras?.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
-                if (fromOp.isNotBlank()) {
-                    runtime.state.beginApplyCurrent(fromOp)
-                }
-                out.putInt(PluginContract.KEY_CODE, PluginContract.CODE_USER_ACTION_REQUIRED)
-                out.putString(PluginContract.KEY_USER_ACTION_KIND, "APPLY_CURRENT")
-                out.putString(
-                    PluginContract.KEY_MESSAGE,
-                    "PluginActionActivity → WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER",
-                )
-            }
+        val validation = PluginContract.validate(method, request)
+        if (!validation.ok) {
+            return errorBundle(validation.code, validation.message)
+        }
+
+        val out = when (method) {
+            PluginContract.METHOD_PING, "ping" -> handlePing()
+            PluginContract.METHOD_STATUS, "status" -> handleStatus(runtime, request)
+            PluginContract.METHOD_IMPORT_MPKG, "import_mpkg" -> handleImportMpkg(runtime, request)
+            PluginContract.METHOD_RENEW_ACTION, "renew_action" -> handleRenewAction(runtime, request)
+            PluginContract.METHOD_OPEN_LIBRARY, "open_library" -> handleOpenLibrary(request)
+            PluginContract.METHOD_APPLY_CURRENT, "apply_current" -> handleApplyCurrent(runtime, request)
             PluginContract.METHOD_NEXT, "next" -> {
                 runtime.queue.next()
-                out.putInt(PluginContract.KEY_CODE, PluginContract.CODE_OK)
+                okBundle()
             }
             PluginContract.METHOD_PREVIOUS, "previous" -> {
                 runtime.queue.previous()
-                out.putInt(PluginContract.KEY_CODE, PluginContract.CODE_OK)
+                okBundle()
             }
             PluginContract.METHOD_STOP, "stop" -> {
-                val op = extras?.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
-                val target = extras?.getString(PluginContract.KEY_TARGET_OPERATION_ID).orEmpty()
+                val op = request.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
+                val target = request.getString(PluginContract.KEY_TARGET_OPERATION_ID).orEmpty()
                 runtime.stop(op, target)
-                // stop must not change bindingState (orthogonal)
-                out.putInt(PluginContract.KEY_CODE, PluginContract.CODE_OK)
+                okBundle()
             }
-            PluginContract.METHOD_STATUS, "status" -> {
-                // Always re-query getWallpaperInfo via single reconciler entry
-                val ctx = context
-                if (ctx != null) {
-                    WallpaperBindingReconciler.reconcileFromSystem(ctx)
-                }
-                out.putInt(PluginContract.KEY_CODE, PluginContract.CODE_OK)
-            }
-            else -> {
-                val fallback = runtime.applyController.requestApply(
-                    hasPublicActivity = false,
-                    hasOemCapability = false,
-                )
-                out.putInt(PluginContract.KEY_CODE, fallback.code)
-                out.putString(PluginContract.KEY_FALLBACK_ACTION, fallback.codeFamily)
-                if (fallback.code == PluginContract.CODE_APPLY_PERMISSION_REQUIRED) {
-                    out.putString(PluginContract.KEY_MESSAGE, "APPLY_PERMISSION_REQUIRED")
-                }
-            }
+            PluginContract.METHOD_DIAGNOSTICS, "diagnostics" -> handleDiagnostics()
+            else -> errorBundle(PluginContract.CODE_BAD_REQUEST, "UNKNOWN_METHOD")
         }
 
-        out.putString(PluginContract.KEY_OPERATION_STATE, runtime.snapshotOperationState())
-        out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
+        echoCallId(request, out)
+        // Always project latest runtime snapshot (orthogonal bindingState).
+        if (!out.containsKey(PluginContract.KEY_OPERATION_STATE)) {
+            out.putString(PluginContract.KEY_OPERATION_STATE, runtime.snapshotOperationState())
+        }
+        if (!out.containsKey(PluginContract.KEY_BINDING_STATE)) {
+            val ctx = context
+            if (ctx != null) {
+                WallpaperBindingReconciler.reconcileFromSystem(ctx)
+            }
+            out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
+        }
+        out.putInt(PluginContract.KEY_PROTOCOL_VERSION, PluginContract.PROTOCOL_VERSION)
         return out
+    }
+
+    private fun handlePing(): Bundle {
+        return okBundle().apply {
+            putInt(PluginContract.KEY_RUNTIME_PID, Process.myPid())
+            putStringArray("capabilities", PluginContract.METHODS.toTypedArray())
+        }
+    }
+
+    private fun handleStatus(runtime: PluginProcessRuntime, request: Bundle): Bundle {
+        val operationId = request.getString(PluginContract.KEY_OPERATION_ID)
+        val ctx = context
+        if (ctx != null) {
+            WallpaperBindingReconciler.reconcileFromSystem(ctx)
+        }
+        val out = okBundle()
+        out.putInt(PluginContract.KEY_RUNTIME_PID, Process.myPid())
+        if (operationId.isNullOrBlank()) {
+            out.putString(PluginContract.KEY_OPERATION_STATE, runtime.snapshotOperationState())
+            out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
+            return out
+        }
+        val rec = runtime.ledger.get(operationId)
+        if (rec == null) {
+            out.putString(PluginContract.KEY_OPERATION_ID, operationId)
+            out.putString(PluginContract.KEY_OPERATION_STATE, "IDLE")
+            out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
+            out.putBoolean(PluginContract.KEY_SOURCE_CONSUMED, false)
+            return out
+        }
+        out.putString(PluginContract.KEY_OPERATION_ID, rec.operationId)
+        out.putString(PluginContract.KEY_OPERATION_STATE, rec.operationState)
+        out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
+        out.putInt(PluginContract.KEY_ACTION_EPOCH, rec.actionEpoch)
+        out.putBoolean(PluginContract.KEY_SOURCE_CONSUMED, rec.sourceConsumed)
+        rec.actionKind?.let { out.putString(PluginContract.KEY_USER_ACTION_KIND, it) }
+        rec.sourceUri?.let { out.putString(PluginContract.KEY_SOURCE_OPERATION_ID, rec.operationId) }
+        // Never re-echo live actionToken on status (one-shot surface).
+        return out
+    }
+
+    private fun handleImportMpkg(runtime: PluginProcessRuntime, request: Bundle): Bundle {
+        val operationId = request.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
+        val sourceUri = request.getString(PluginContract.KEY_SOURCE_URI)
+        val displayName = request.getString(PluginContract.KEY_DISPLAY_NAME)
+        val rec = runtime.ledger.beginImport(operationId, sourceUri, displayName)
+        runtime.state.markStaged(operationId)
+        // Domain: import requires user confirm before stage is "consumed" from Mineradio POV.
+        // Keep ledger ACTION_PENDING until renew_action.
+        return Bundle().apply {
+            putInt(PluginContract.KEY_CODE, PluginContract.CODE_USER_ACTION_REQUIRED)
+            putString(PluginContract.KEY_OPERATION_ID, rec.operationId)
+            putString(PluginContract.KEY_OPERATION_STATE, rec.operationState)
+            putInt(PluginContract.KEY_ACTION_EPOCH, rec.actionEpoch)
+            putString(PluginContract.KEY_ACTION_TOKEN, rec.actionToken)
+            putString(PluginContract.KEY_USER_ACTION_KIND, rec.actionKind)
+            putString(PluginContract.KEY_MESSAGE, "confirmUserAction required")
+            putBoolean(PluginContract.KEY_SOURCE_CONSUMED, false)
+        }
+    }
+
+    private fun handleRenewAction(runtime: PluginProcessRuntime, request: Bundle): Bundle {
+        val operationId = request.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
+        val epoch = if (request.containsKey(PluginContract.KEY_ACTION_EPOCH)) {
+            request.getInt(PluginContract.KEY_ACTION_EPOCH)
+        } else {
+            request.getLong(PluginContract.KEY_ACTION_EPOCH).toInt()
+        }
+        val token = request.getString(PluginContract.KEY_ACTION_TOKEN)
+        val (code, rec) = runtime.ledger.confirmUserAction(operationId, epoch, token)
+        val out = Bundle().apply {
+            putInt(PluginContract.KEY_CODE, code)
+            putString(PluginContract.KEY_OPERATION_ID, operationId)
+        }
+        if (rec != null) {
+            out.putString(PluginContract.KEY_OPERATION_STATE, rec.operationState)
+            out.putInt(PluginContract.KEY_ACTION_EPOCH, rec.actionEpoch)
+            out.putBoolean(PluginContract.KEY_SOURCE_CONSUMED, rec.sourceConsumed)
+            if (code == PluginContract.CODE_OK) {
+                runtime.state.markStaged(operationId)
+                out.putString(PluginContract.KEY_MESSAGE, "sourceConsumed; Mineradio must revoke sourceUri")
+            } else {
+                out.putString(PluginContract.KEY_MESSAGE, "ACTION_TOKEN_INVALID_OR_USED")
+            }
+        } else {
+            out.putString(PluginContract.KEY_MESSAGE, "UNKNOWN_OPERATION")
+        }
+        return out
+    }
+
+    private fun handleOpenLibrary(request: Bundle): Bundle {
+        val operationId = request.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
+        return Bundle().apply {
+            putInt(PluginContract.KEY_CODE, PluginContract.CODE_USER_ACTION_REQUIRED)
+            putString(PluginContract.KEY_OPERATION_ID, operationId)
+            putString(PluginContract.KEY_USER_ACTION_KIND, "OPEN_LIBRARY")
+            putString(PluginContract.KEY_MESSAGE, "open BrowseActivity")
+        }
+    }
+
+    private fun handleApplyCurrent(runtime: PluginProcessRuntime, request: Bundle): Bundle {
+        val fromOp = request.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
+        if (fromOp.isNotBlank()) {
+            runtime.state.beginApplyCurrent(fromOp)
+        }
+        return Bundle().apply {
+            putInt(PluginContract.KEY_CODE, PluginContract.CODE_USER_ACTION_REQUIRED)
+            putString(PluginContract.KEY_USER_ACTION_KIND, "APPLY_CURRENT")
+            putString(
+                PluginContract.KEY_MESSAGE,
+                "PluginActionActivity → WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER",
+            )
+        }
+    }
+
+    private fun handleDiagnostics(): Bundle {
+        return okBundle().apply {
+            putInt(PluginContract.KEY_RUNTIME_PID, Process.myPid())
+            putInt("ledgerSize", PluginProcessRuntime.ledger.size())
+        }
+    }
+
+    private fun okBundle(): Bundle =
+        Bundle().apply { putInt(PluginContract.KEY_CODE, PluginContract.CODE_OK) }
+
+    private fun errorBundle(code: Int, message: String?): Bundle =
+        Bundle().apply {
+            putInt(PluginContract.KEY_CODE, code)
+            if (!message.isNullOrBlank()) putString(PluginContract.KEY_MESSAGE, message)
+        }
+
+    private fun echoCallId(request: Bundle, result: Bundle) {
+        val callId = request.getString(PluginContract.KEY_CALL_ID)
+        if (!callId.isNullOrBlank() && !result.containsKey(PluginContract.KEY_CALL_ID)) {
+            result.putString(PluginContract.KEY_CALL_ID, callId)
+        }
     }
 
     override fun query(
