@@ -38,6 +38,13 @@
             android:name="mineradioCallerCertSha256"
             android:value="${mineradioCallerCertSha256}" />
 
+        <!-- WP-08/WP-10A: control Provider on :we_runtime (protocol 1). -->
+        <provider
+            android:name=".plugin.PluginControlProvider"
+            android:authorities="com.motif.wallpaperengine.control"
+            android:directBootAware="false"
+            android:exported="true"
+            android:process=":we_runtime" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
@@ -48,6 +55,13 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- WP-08: user-action Activity for CHANGE_LIVE_WALLPAPER (default process). -->
+        <activity
+            android:name=".plugin.PluginActionActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <activity
             android:name=".MainActivity"
