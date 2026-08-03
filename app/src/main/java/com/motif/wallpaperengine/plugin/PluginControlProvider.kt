@@ -2,21 +2,38 @@ package com.motif.wallpaperengine.plugin
 
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.Context
+import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
+import android.os.Binder
 import android.os.Bundle
 import android.os.Process
+import java.security.MessageDigest
 
 /**
  * Protocol-1 control Provider on process `:we_runtime`.
  *
- * WP-08 queue/apply surface + WP-10A ping / import_mpkg / renew_action (actionToken).
- * Uses [PluginProcessRuntime] + [PluginOperationLedger]; no second binding truth.
+ * WP-08 queue/apply + WP-10A ping / import_mpkg / renew_action (actionToken).
+ * Caller allowlist: Binder UID → package + cert SHA-256 (shell debug-only).
+ * Native Mineradio 1.1.7 base: allowlist inject via -PmineradioCallerCertSha256.
  */
 class PluginControlProvider : ContentProvider() {
+    @Volatile
+    internal var callerPolicyOverride: CallerPolicy? = null
+
     override fun onCreate(): Boolean = true
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
+        val ctx = context
+            ?: return errorBundle(PluginContract.CODE_INTERNAL_ERROR, "NO_CONTEXT")
+
+        val policy = callerPolicyOverride ?: buildDefaultCallerPolicy(ctx)
+        val decision = policy.evaluate(Binder.getCallingUid())
+        if (!decision.allowed) {
+            return errorBundle(PluginContract.CODE_CALLER_REJECTED, decision.reason)
+        }
+
         val runtime = PluginProcessRuntime
         val request = extras ?: Bundle()
         // Force unparcel before reads.
@@ -185,6 +202,59 @@ class PluginControlProvider : ContentProvider() {
         return okBundle().apply {
             putInt(PluginContract.KEY_RUNTIME_PID, Process.myPid())
             putInt("ledgerSize", PluginProcessRuntime.ledger.size())
+        }
+    }
+
+    private fun buildDefaultCallerPolicy(ctx: Context): CallerPolicy {
+        val certProp = readBuildConfigString("MINERADIO_CALLER_CERT_SHA256")
+        val debug = readBuildConfigBoolean("DEBUG", default = true)
+        val certs = CallerPolicy.normalizeCertSet(
+            listOf(certProp).filter { it.isNotBlank() && it != "0".repeat(64) },
+        )
+        return CallerPolicy(
+            allowedCertSha256 = certs,
+            isDebugBuild = debug,
+            allowShellInDebug = debug,
+            packageIdentitiesForUid = { uid -> resolvePackageIdentities(ctx, uid) },
+        )
+    }
+
+    private fun readBuildConfigString(field: String): String {
+        return try {
+            val buildConfigClass = Class.forName("com.motif.wallpaperengine.BuildConfig")
+            (buildConfigClass.getField(field).get(null) as? String).orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun readBuildConfigBoolean(field: String, default: Boolean): Boolean {
+        return try {
+            val buildConfigClass = Class.forName("com.motif.wallpaperengine.BuildConfig")
+            buildConfigClass.getField(field).getBoolean(null)
+        } catch (_: Exception) {
+            default
+        }
+    }
+
+    private fun resolvePackageIdentities(
+        ctx: Context,
+        uid: Int,
+    ): List<CallerPolicy.PackageIdentity> {
+        val pm = ctx.packageManager
+        val packages = pm.getPackagesForUid(uid) ?: return emptyList()
+        return packages.mapNotNull { pkg ->
+            try {
+                @Suppress("DEPRECATION")
+                val info = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES)
+                @Suppress("DEPRECATION")
+                val sig = info.signatures?.firstOrNull()?.toByteArray() ?: return@mapNotNull null
+                val digest = MessageDigest.getInstance("SHA-256").digest(sig)
+                val hex = digest.joinToString("") { b -> "%02x".format(b) }
+                CallerPolicy.PackageIdentity(pkg, hex)
+            } catch (_: Exception) {
+                null
+            }
         }
     }
 
