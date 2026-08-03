@@ -28,8 +28,9 @@ class PluginControlProvider : ContentProvider() {
         val ctx = context
             ?: return errorBundle(PluginContract.CODE_INTERNAL_ERROR, "NO_CONTEXT")
 
+        val callingUid = Binder.getCallingUid()
         val policy = callerPolicyOverride ?: buildDefaultCallerPolicy(ctx)
-        val decision = policy.evaluate(Binder.getCallingUid())
+        val decision = policy.evaluate(callingUid)
         if (!decision.allowed) {
             return errorBundle(PluginContract.CODE_CALLER_REJECTED, decision.reason)
         }
@@ -44,10 +45,12 @@ class PluginControlProvider : ContentProvider() {
             return errorBundle(validation.code, validation.message)
         }
 
+        val caller = CallerStamp.from(decision, callingUid)
         val out = when (method) {
             PluginContract.METHOD_PING, "ping" -> handlePing()
             PluginContract.METHOD_STATUS, "status" -> handleStatus(runtime, request)
-            PluginContract.METHOD_IMPORT_MPKG, "import_mpkg" -> handleImportMpkg(runtime, request)
+            PluginContract.METHOD_IMPORT_MPKG, "import_mpkg" ->
+                handleImportMpkg(runtime, request, caller)
             PluginContract.METHOD_RENEW_ACTION, "renew_action" -> handleRenewAction(runtime, request)
             PluginContract.METHOD_OPEN_LIBRARY, "open_library" -> handleOpenLibrary(request)
             PluginContract.METHOD_APPLY_CURRENT, "apply_current" -> handleApplyCurrent(runtime, request)
@@ -70,19 +73,51 @@ class PluginControlProvider : ContentProvider() {
         }
 
         echoCallId(request, out)
+        attachCallerStamp(out, caller)
         // Always project latest runtime snapshot (orthogonal bindingState).
         if (!out.containsKey(PluginContract.KEY_OPERATION_STATE)) {
             out.putString(PluginContract.KEY_OPERATION_STATE, runtime.snapshotOperationState())
         }
         if (!out.containsKey(PluginContract.KEY_BINDING_STATE)) {
-            val ctx = context
-            if (ctx != null) {
-                WallpaperBindingReconciler.reconcileFromSystem(ctx)
+            if (context != null) {
+                WallpaperBindingReconciler.reconcileFromSystem(context!!)
             }
             out.putString(PluginContract.KEY_BINDING_STATE, runtime.snapshotBindingState())
         }
         out.putInt(PluginContract.KEY_PROTOCOL_VERSION, PluginContract.PROTOCOL_VERSION)
         return out
+    }
+
+    /** Identity derived from Binder + CallerPolicy only (never from request extras). */
+    internal data class CallerStamp(
+        val packageName: String?,
+        val uid: Int,
+        val certAllowlistMatch: Boolean,
+        val reason: String,
+    ) {
+        companion object {
+            fun from(decision: CallerPolicy.Decision, callingUid: Int): CallerStamp {
+                val pkg = decision.packageName
+                // Shell debug path is never continuous-E3 cert allowlist match.
+                val certMatch =
+                    decision.allowed &&
+                        decision.reason == "ALLOW" &&
+                        pkg != null &&
+                        pkg != "shell"
+                return CallerStamp(
+                    packageName = pkg,
+                    uid = callingUid,
+                    certAllowlistMatch = certMatch,
+                    reason = decision.reason,
+                )
+            }
+        }
+    }
+
+    private fun attachCallerStamp(out: Bundle, caller: CallerStamp) {
+        caller.packageName?.let { out.putString(PluginContract.KEY_CALLER_PACKAGE, it) }
+        out.putInt(PluginContract.KEY_CALLER_UID, caller.uid)
+        out.putBoolean(PluginContract.KEY_CERT_ALLOWLIST_MATCH, caller.certAllowlistMatch)
     }
 
     private fun handlePing(): Bundle {
@@ -120,15 +155,32 @@ class PluginControlProvider : ContentProvider() {
         out.putBoolean(PluginContract.KEY_SOURCE_CONSUMED, rec.sourceConsumed)
         rec.actionKind?.let { out.putString(PluginContract.KEY_USER_ACTION_KIND, it) }
         rec.sourceUri?.let { out.putString(PluginContract.KEY_SOURCE_OPERATION_ID, rec.operationId) }
+        // Ledger-bound caller identity (set at import; not request-forged).
+        rec.callerPackage?.let { out.putString(PluginContract.KEY_CALLER_PACKAGE, it) }
+        if (rec.callerUid >= 0) {
+            out.putInt(PluginContract.KEY_CALLER_UID, rec.callerUid)
+        }
+        out.putBoolean(PluginContract.KEY_CERT_ALLOWLIST_MATCH, rec.certAllowlistMatch)
         // Never re-echo live actionToken on status (one-shot surface).
         return out
     }
 
-    private fun handleImportMpkg(runtime: PluginProcessRuntime, request: Bundle): Bundle {
+    private fun handleImportMpkg(
+        runtime: PluginProcessRuntime,
+        request: Bundle,
+        caller: CallerStamp,
+    ): Bundle {
         val operationId = request.getString(PluginContract.KEY_OPERATION_ID).orEmpty()
         val sourceUri = request.getString(PluginContract.KEY_SOURCE_URI)
         val displayName = request.getString(PluginContract.KEY_DISPLAY_NAME)
-        val rec = runtime.ledger.beginImport(operationId, sourceUri, displayName)
+        val rec = runtime.ledger.beginImport(
+            operationId = operationId,
+            sourceUri = sourceUri,
+            displayName = displayName,
+            callerPackage = caller.packageName,
+            callerUid = caller.uid,
+            certAllowlistMatch = caller.certAllowlistMatch,
+        )
         runtime.state.markStaged(operationId)
         // Domain: import requires user confirm before stage is "consumed" from Mineradio POV.
         // Keep ledger ACTION_PENDING until renew_action.

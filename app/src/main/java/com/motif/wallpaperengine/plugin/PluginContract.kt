@@ -76,6 +76,12 @@ object PluginContract {
     const val KEY_BYTES = "bytes"
     const val KEY_SHA256 = "sha256"
     const val KEY_RUNTIME_PID = "runtimePid"
+    /** Binder caller package that passed CallerPolicy (null/shell → "shell"). */
+    const val KEY_CALLER_PACKAGE = "callerPackage"
+    /** Binder calling UID (process identity; not forged by extras). */
+    const val KEY_CALLER_UID = "callerUid"
+    /** True when package+cert allowlist matched (shell debug is false for continuous E3). */
+    const val KEY_CERT_ALLOWLIST_MATCH = "certAllowlistMatch"
     const val KEY_ENGINE_INSTALLED = "engineInstalled"
     const val KEY_ENGINE_VERSION = "engineVersion"
     const val KEY_ACTIVE_PACKAGE = "activePackage"
