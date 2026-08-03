@@ -61,6 +61,8 @@ object PluginContract {
     const val KEY_OPERATION_ID = "operationId"
     const val KEY_TARGET_OPERATION_ID = "targetOperationId"
     const val KEY_ACTION_EPOCH = "actionEpoch"
+    /** Random one-shot action token for HMI confirmUserAction (not PendingIntent). */
+    const val KEY_ACTION_TOKEN = "actionToken"
     const val KEY_ACTIVE_OPERATION_ID = "activeOperationId"
     const val KEY_COMPLETED_OPERATION_IDS = "completedOperationIds"
     const val KEY_CODE = "code"

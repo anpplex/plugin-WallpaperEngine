@@ -11,6 +11,8 @@ object PluginProcessRuntime {
     val state: PluginRuntimeState = PluginRuntimeState()
     val queue: WallpaperQueue = WallpaperQueue()
     val applyController: WallpaperApplyController = WallpaperApplyController()
+    /** WP-10A: import_mpkg / renew_action actionToken ledger (process-scoped). */
+    val ledger: PluginOperationLedger = PluginOperationLedger()
 
     /**
      * stop: cancel operation + queue work; bindingState is orthogonal (unchanged).
