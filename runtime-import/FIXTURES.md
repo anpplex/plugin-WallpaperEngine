@@ -102,8 +102,26 @@ expectedExit:
   GREEN / REFACTOR / VERIFY: 0
 ```
 
-## Out of scope for this draft
+## Fixture file locations (Plugin worktree)
 
-- Actual JSON fixture bodies (RED harness will create them under Plugin `runtime-import/` later).
+Catalog basenames live under:
+
+```text
+scripts/tests/fixtures/
+  manifest-unknown-signature-permission.json
+  manifest-authority-conflict.json
+  manifest-missing-dex.json
+  manifest-resource-id-conflict.json
+  manifest-inventory-pass.json   # optional positive (not required catalog exactFile)
+```
+
+Harness: `scripts/tests/test-runtime-import.sh` invokes
+`scripts/verify-imported-runtime.sh --inventory <fixture> --mode <mode>` and asserts
+non-zero exit + stderr tokens for the four negatives; exit 0 for the positive.
+
+Schema: `runtime-import/manifest-map.schema.json` (`schemaVersion=wp12a-manifest-map/v1`).
+
+## Out of scope
+
 - Native/ABI/JNI closure (WP-12B / `native-libs.schema.json`).
 - Device evidence collection (`--mode runtime-inventory`); fixtures are host-side import/verify only.
