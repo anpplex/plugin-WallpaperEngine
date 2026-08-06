@@ -112,7 +112,10 @@
         "name": "androidx.core.content.FileProvider",
         "exported": false,
         "process": null,
-        "permission": null
+        "permission": null,
+        "authorities": [
+          "io.wallpaperengine.weclient.fileprovider"
+        ]
       }
     ]
   },
