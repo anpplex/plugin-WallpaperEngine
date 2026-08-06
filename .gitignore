@@ -52,7 +52,11 @@ audit-*/
 !scripts/setwp_user.dex
 
 # WP-12 local-only runtime/device evidence (never stage)
+# Official APK/splits, extracts, JKS, DEX/SO blobs, screenshots, logcat stay local.
 /work/
 work/runtime-audit/
 work/runtime/
 work/device-evidence/
+# Explicit product path (also covered by **/build/)
+/app/build/
+app/build/

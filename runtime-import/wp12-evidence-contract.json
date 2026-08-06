@@ -1,0 +1,59 @@
+{
+  "schema": "wp12-evidence-contract/v1",
+  "title": "WP-12 evidence contract (scaffold)",
+  "description": "Contract for collect → record-raw → seal. Fail-closed when required inputs are missing. Official binaries stay local-ignored.",
+  "modes": {
+    "runtime-inventory": {
+      "taskIds": ["WP-12A"],
+      "collector": "scripts/collect-wp12-evidence.py",
+      "sealer": "scripts/seal-wp12-evidence.py",
+      "requiredInputs": [
+        "transactionReceipt",
+        "attemptNo",
+        "officialApkPathOrPositiveFixture",
+        "inventoryJson"
+      ],
+      "forbiddenInGit": [
+        "work/runtime-audit/",
+        "work/runtime/",
+        "work/device-evidence/",
+        "app/build/",
+        "*.apk",
+        "*.dex",
+        "*.so",
+        "*.jks"
+      ],
+      "effectiveDoneBar": "manifest/dex/resource/authority/permission inventory sealed with hashes only",
+      "redFailureClasses": [
+        "unknown-signature-permission",
+        "authority-conflict",
+        "missing-dex",
+        "resource-id-conflict"
+      ]
+    }
+  },
+  "sealRules": {
+    "requireSchema": "runtime-import/wp12-evidence.schema.json",
+    "requireEffectiveDoneDerived": true,
+    "rejectCallerSuppliedIdentity": true,
+    "rejectMissingInventoryKeys": [
+      "manifest",
+      "dex",
+      "resources",
+      "authorities",
+      "permissions"
+    ],
+    "rejectEmbeddedBlobs": true
+  },
+  "progress": {
+    "updater": "scripts/update-wp12-progress.py",
+    "experimentalWeightPercent": {
+      "WP-12A": 25,
+      "WP-12B": 25,
+      "WP-12C": 20,
+      "WP-12D": 15,
+      "WP-12E": 15
+    },
+    "note": "Progress updates only after sealed EffectiveDone + dual-repo closure; scaffold does not write progress."
+  }
+}
