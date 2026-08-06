@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mineradio.local/schemas/wp12a-manifest-map/v1",
+  "title": "WP-12A official APK runtime inventory (manifest map)",
+  "description": "WP-12A desensitized inventory of official APK/splits: manifest, DEX, resources, authority, permission, and component map. Verifier fail-closes on UNKNOWN_SIGNATURE_PERMISSION, AUTHORITY_CONFLICT, MISSING_DEX, RESOURCE_ID_CONFLICT. Product path: runtime-import/manifest-map.schema.json (scaffolded from verification draft).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageName",
+    "apkSha256",
+    "manifest",
+    "dex",
+    "resources",
+    "authorities",
+    "permissions",
+    "components",
+    "failClosed"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "wp12a-manifest-map/v1"
+    },
+    "packageName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Android package name from the official base APK."
+    },
+    "apkSha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 of the official base APK bytes (hex lowercase)."
+    },
+    "versionCode": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "versionName": {
+      "type": "string"
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packageName", "minSdk", "targetSdk", "sha256"],
+      "properties": {
+        "packageName": { "type": "string", "minLength": 1 },
+        "applicationProcess": {
+          "type": ["string", "null"],
+          "description": "Default application process attribute, or null if unset."
+        },
+        "minSdk": { "type": "integer", "minimum": 1 },
+        "targetSdk": { "type": "integer", "minimum": 1 },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA-256 of AndroidManifest.xml binary/XML bytes as extracted."
+        }
+      }
+    },
+    "dex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "entries"],
+      "description": "DEX inventory. count==0 or missing classes.dex is MISSING_DEX (fail-closed).",
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "sha256", "sizeBytes"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^classes([2-9]|[1-9][0-9]+)?\\.dex$"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "sizeBytes": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "idIndex"],
+      "description": "Resource ID inventory. Duplicate IDs in idIndex source → RESOURCE_ID_CONFLICT.",
+      "properties": {
+        "arscSha256": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "type", "name", "sha256"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^0x[0-9a-f]{8}$"
+              },
+              "type": { "type": "string", "minLength": 1 },
+              "name": { "type": "string", "minLength": 1 },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          }
+        },
+        "idIndex": {
+          "type": "object",
+          "description": "Map of unique resource ID (0x########) → qualified name. Built only after conflict scan.",
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "authorities": {
+      "type": "array",
+      "description": "Provider authorities. Duplicate authority strings → AUTHORITY_CONFLICT.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["authority", "componentName"],
+        "properties": {
+          "authority": { "type": "string", "minLength": 1 },
+          "componentName": { "type": "string", "minLength": 1 },
+          "exported": { "type": "boolean" },
+          "grantUriPermissions": { "type": "boolean" }
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared", "uses", "signatureKnown"],
+      "description": "Permission inventory. Signature-level declared/uses not in signatureKnown → UNKNOWN_SIGNATURE_PERMISSION.",
+      "properties": {
+        "declared": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "protectionLevel"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "protectionLevel": {
+                "type": "string",
+                "enum": [
+                  "normal",
+                  "dangerous",
+                  "signature",
+                  "signatureOrSystem",
+                  "internal",
+                  "unknown"
+                ]
+              }
+            }
+          }
+        },
+        "uses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "maxSdkVersion": { "type": ["integer", "null"] }
+            }
+          }
+        },
+        "signatureKnown": {
+          "type": "array",
+          "description": "Allowlist of signature-level permission names recognized for this official runtime import.",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activities", "services", "receivers", "providers"],
+      "description": "Component map (name → process/export/permission surface).",
+      "properties": {
+        "activities": { "$ref": "#/$defs/componentList" },
+        "services": { "$ref": "#/$defs/componentList" },
+        "receivers": { "$ref": "#/$defs/componentList" },
+        "providers": { "$ref": "#/$defs/componentList" }
+      }
+    },
+    "failClosed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "failures"],
+      "description": "Verifier verdict. ok must be true only when failures is empty.",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "UNKNOWN_SIGNATURE_PERMISSION",
+                  "AUTHORITY_CONFLICT",
+                  "MISSING_DEX",
+                  "RESOURCE_ID_CONFLICT"
+                ]
+              },
+              "message": { "type": "string", "minLength": 1 },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "componentList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "exported"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "exported": { "type": "boolean" },
+          "process": { "type": ["string", "null"] },
+          "permission": { "type": ["string", "null"] },
+          "authorities": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

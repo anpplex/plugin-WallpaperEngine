@@ -50,3 +50,9 @@ audit-*/
 
 # Exception: shell bind helper
 !scripts/setwp_user.dex
+
+# WP-12 local-only runtime/device evidence (never stage)
+/work/
+work/runtime-audit/
+work/runtime/
+work/device-evidence/
