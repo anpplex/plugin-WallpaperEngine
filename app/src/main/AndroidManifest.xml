@@ -63,6 +63,13 @@
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- WP-12C experimental: embedded preview shell (not exported). -->
+        <activity
+            android:name=".plugin.EmbeddedPreviewActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
