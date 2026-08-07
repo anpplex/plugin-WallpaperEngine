@@ -1646,5 +1646,142 @@ class TestWp12bPhaseAndPlugin(unittest.TestCase):
             self.assertEqual(receipt["legs"]["plugin"]["state"], "PLUGIN_COMMITTED")
 
 
+class TestNativeClosureSeal(unittest.TestCase):
+    """WP-12B native-closure inventory seal (no WP-12A keys; EffectiveDone false)."""
+
+    OFFICIAL_SHA = "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0"
+    PASS_FIXTURE = PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "native-inventory-pass.json"
+    NEG_FIXTURE = PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "native-missing-needed.json"
+
+    def _init_wp12b(self, tmp: str) -> Path:
+        proc = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12B",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        return Path(tmp) / "wp-12b.json"
+
+    def test_seal_native_pass_fixture_inventory_sealed_effective_done_false(self) -> None:
+        """Tiny native inventory → inventorySealed=true; EffectiveDone always false."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_wp12b(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "native-closure",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            collect_payload = parse_json_stdout(collect)
+            self.assertEqual(collect_payload.get("mode"), "native-closure")
+            self.assertFalse(collect_payload.get("EffectiveDone"))
+
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertEqual(raw.get("mode"), "native-closure")
+            self.assertEqual(raw["inventory"].get("schemaVersion"), "wp12b-native-libs/v1")
+            # Native inventories must not require WP-12A keys.
+            for key in ("manifest", "dex", "resources", "authorities", "permissions"):
+                self.assertNotIn(key, raw["inventory"])
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(
+                SEAL_PY,
+                "--raw",
+                str(raw_out),
+                "--out",
+                str(sealed_out),
+                "--require-official-sha",
+            )
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_payload = parse_json_stdout(seal)
+            self.assertTrue(seal_payload.get("inventorySealed"))
+            self.assertFalse(seal_payload.get("EffectiveDone"))
+            self.assertTrue(seal_payload.get("native"))
+
+            sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+            self.assertTrue(sealed.get("inventorySealed"))
+            self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertEqual(sealed.get("mode"), "native-closure")
+            self.assertEqual(sealed.get("inventorySchemaVersion"), "wp12b-native-libs/v1")
+            self.assertEqual(sealed["hashes"].get("officialApkSha256"), self.OFFICIAL_SHA)
+            inv = sealed["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12b-native-libs/v1")
+            self.assertIn("abis", inv)
+            self.assertIn("failClosed", inv)
+            self.assertNotIn("manifest", inv)
+            self.assertEqual(inv.get("counts", {}).get("arm64LibCount"), 1)
+            self.assertTrue(sealed.get("failClosed", {}).get("ok"))
+
+    def test_seal_native_missing_needed_fails_closed(self) -> None:
+        """failClosed.ok=false → FAIL_CLOSED_NOT_OK; no inventorySealed claim."""
+        self.assertTrue(self.NEG_FIXTURE.is_file(), f"missing fixture {self.NEG_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_wp12b(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "native-closure",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.NEG_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertNotEqual(seal.returncode, 0)
+            payload = parse_json_stdout(seal)
+            self.assertEqual(payload.get("failureReason"), "FAIL_CLOSED_NOT_OK")
+            self.assertFalse(sealed_out.exists())
+
+    def test_seal_native_rejects_wp12a_key_requirement(self) -> None:
+        """Native raw with only native keys must not fail INVENTORY_INCOMPLETE for WP-12A keys."""
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = {
+                "schema": "wp12-evidence-raw/v1",
+                "mode": "native-closure",
+                "taskId": "WP-12B",
+                "transactionId": "txn-native-seal-test-01",
+                "runUuid": "run-native-seal-test-01",
+                "attemptNo": 1,
+                "officialApkSha256": self.OFFICIAL_SHA,
+                "inventory": json.loads(self.PASS_FIXTURE.read_text(encoding="utf-8")),
+                "sealed": False,
+                "EffectiveDone": False,
+            }
+            raw_out = Path(tmp) / "raw.json"
+            raw_out.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            payload = parse_json_stdout(seal)
+            self.assertTrue(payload.get("inventorySealed"))
+            self.assertFalse(payload.get("EffectiveDone"))
+
+
 if __name__ == "__main__":
     unittest.main()

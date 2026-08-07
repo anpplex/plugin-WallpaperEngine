@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "wp12b-native-libs/v1",
+  "packageName": "io.wallpaperengine.weclient",
+  "apkSha256": "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0",
+  "versionCode": 4354,
+  "versionName": "2.8.8",
+  "abis": [
+    {
+      "name": "arm64-v8a",
+      "libs": [
+        {
+          "name": "libscenejni.so",
+          "path": "lib/arm64-v8a/libscenejni.so",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "sizeBytes": 1024,
+          "soname": "libscenejni.so",
+          "needed": ["libc.so", "libm.so", "libdl.so", "liblog.so", "libandroid.so"],
+          "elfClass": "ELFCLASS64",
+          "elfMachine": "EM_AARCH64"
+        }
+      ]
+    }
+  ],
+  "jniLoadLibs": ["scenejni"],
+  "closure": {
+    "missingNeeded": [],
+    "wrongAbi": [],
+    "duplicateSoname": [],
+    "systemNeeded": ["libc.so", "libm.so", "libdl.so", "liblog.so", "libandroid.so"]
+  },
+  "failClosed": {
+    "ok": true,
+    "failures": []
+  }
+}
