@@ -751,7 +751,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
     MERGED_SHA = "4255a9f16141818ba0beeab9bde1eddb0f862c31"
     FEAT_SHA = "e35250f1b5da38f685acabd5121698195dd683bb"
 
-    def _init_and_verify(self, tmp: str) -> Path:
+    def _init_local(self, tmp: str) -> Path:
         init = run_py(
             TXN_PY,
             "init",
@@ -766,6 +766,26 @@ class TestPluginLegBookkeeping(unittest.TestCase):
             "e00f8f87753a31070b40754223e2a216c5322827",
         )
         self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+        return Path(tmp) / "wp-12a.json"
+
+    def _init_at_state(self, tmp: str, state: str) -> Path:
+        """Init then stamp state for plugin-leg unit tests (skip slow phase argv)."""
+        path = self._init_local(tmp)
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["state"] = state
+        receipt["phaseEvents"] = [
+            {"phase": "RED", "stateAfter": "RED_RECORDED"},
+            {"phase": "GREEN", "stateAfter": "GREEN_RECORDED"},
+            {"phase": "REFACTOR", "stateAfter": "REFACTOR_RECORDED"},
+            {"phase": "VERIFY", "stateAfter": "VERIFIED"},
+        ]
+        receipt["EffectiveDone"] = False
+        path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def _init_and_verify(self, tmp: str) -> Path:
+        """Real phase fences → VERIFIED (one integration path only)."""
+        self._init_local(tmp)
         for phase in ("RED", "GREEN", "REFACTOR", "VERIFY"):
             proc = run_py(
                 TXN_PY,
@@ -784,7 +804,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
 
     def test_prepare_and_commit_plugin_happy_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            txn_path = self._init_and_verify(tmp)
+            txn_path = self._init_at_state(tmp, "VERIFIED")
 
             prep = run_py(
                 TXN_PY,
@@ -840,7 +860,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
 
     def test_record_plugin_merged_from_verified(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            txn_path = self._init_and_verify(tmp)
+            txn_path = self._init_at_state(tmp, "VERIFIED")
             merged = run_py(
                 TXN_PY,
                 "record-plugin-merged",
@@ -875,7 +895,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
         self.assertEqual(tree.returncode, 0, msg=tree.stderr)
         tree_sha = tree.stdout.strip()
         with tempfile.TemporaryDirectory() as tmp:
-            self._init_and_verify(tmp)
+            self._init_at_state(tmp, "VERIFIED")
             prep = run_py(
                 TXN_PY,
                 "prepare-plugin",
@@ -895,16 +915,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
 
     def test_out_of_order_prepare_plugin_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            init = run_py(
-                TXN_PY,
-                "init",
-                "--task",
-                "WP-12A",
-                "--transactions",
-                tmp,
-                "--local-only",
-            )
-            self.assertEqual(init.returncode, 0)
+            self._init_local(tmp)
             prep = run_py(
                 TXN_PY,
                 "prepare-plugin",
@@ -946,7 +957,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
 
     def test_commit_plugin_requires_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self._init_and_verify(tmp)
+            self._init_at_state(tmp, "VERIFIED")
             commit = run_py(
                 TXN_PY,
                 "commit-plugin",
@@ -962,7 +973,7 @@ class TestPluginLegBookkeeping(unittest.TestCase):
 
     def test_plugin_committed_does_not_set_effective_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self._init_and_verify(tmp)
+            self._init_at_state(tmp, "VERIFIED")
             merged = run_py(
                 TXN_PY,
                 "record-plugin-merged",
@@ -997,62 +1008,8 @@ class TestPluginLegBookkeeping(unittest.TestCase):
 
     def test_prepare_after_evidence_sealed_tolerated(self) -> None:
         """EVIDENCE_SEALED is a valid prereq for prepare-plugin (attach tolerate)."""
-        fixture = PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "manifest-inventory-pass.json"
         with tempfile.TemporaryDirectory() as tmp:
-            txn_path = self._init_and_verify(tmp)
-            open_a = run_py(
-                TXN_PY,
-                "open-attempt",
-                "--task",
-                "WP-12A",
-                "--attempt-no",
-                "1",
-                "--transactions",
-                tmp,
-            )
-            self.assertEqual(open_a.returncode, 0, msg=open_a.stdout + open_a.stderr)
-            raw_out = Path(tmp) / "raw.json"
-            collect = run_py(
-                COLLECT_PY,
-                "--mode",
-                "runtime-inventory",
-                "--out",
-                str(raw_out),
-                "--transaction",
-                str(txn_path),
-                "--attempt-no",
-                "1",
-                "--inventory",
-                str(fixture),
-            )
-            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
-            rec = run_py(
-                TXN_PY,
-                "record-raw",
-                "--task",
-                "WP-12A",
-                "--path",
-                str(raw_out),
-                "--transactions",
-                tmp,
-            )
-            self.assertEqual(rec.returncode, 0, msg=rec.stdout + rec.stderr)
-            sealed_out = Path(tmp) / "sealed.json"
-            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
-            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
-            seal_txn = run_py(
-                TXN_PY,
-                "seal-evidence",
-                "--task",
-                "WP-12A",
-                "--path",
-                str(sealed_out),
-                "--transactions",
-                tmp,
-            )
-            self.assertEqual(seal_txn.returncode, 0, msg=seal_txn.stdout + seal_txn.stderr)
-            self.assertEqual(parse_json_stdout(seal_txn).get("state"), "EVIDENCE_SEALED")
-
+            self._init_at_state(tmp, "EVIDENCE_SEALED")
             prep = run_py(
                 TXN_PY,
                 "prepare-plugin",
@@ -1079,6 +1036,29 @@ class TestPluginLegBookkeeping(unittest.TestCase):
             payload = parse_json_stdout(merged)
             self.assertEqual(payload.get("state"), "PLUGIN_COMMITTED")
             self.assertFalse(payload.get("EffectiveDone"))
+
+    def test_real_verified_then_record_plugin_merged_integration(self) -> None:
+        """One real phase-fence → record-plugin-merged path (no EffectiveDone)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_and_verify(tmp)
+            merged = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12A",
+                "--merge-sha",
+                self.MERGED_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(merged.returncode, 0, msg=merged.stdout + merged.stderr)
+            payload = parse_json_stdout(merged)
+            self.assertEqual(payload.get("state"), "PLUGIN_COMMITTED")
+            self.assertFalse(payload.get("EffectiveDone"))
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "PLUGIN_COMMITTED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 4)
 
 
 if __name__ == "__main__":

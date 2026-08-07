@@ -1039,14 +1039,27 @@ def cmd_seal_evidence(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _git(*git_args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *git_args],
-        cwd=str(cwd or PLUGIN_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _git(
+    *git_args: str,
+    cwd: Path | None = None,
+    timeout: float | None = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *git_args],
+            cwd=str(cwd or PLUGIN_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["git", *git_args],
+            returncode=124,
+            stdout="",
+            stderr=f"git timeout after {timeout}s: {' '.join(git_args)}",
+        )
 
 
 def _require_hex_sha(raw: str | None, *, label: str, lengths: tuple[int, ...] = (40,)) -> str:
@@ -1420,9 +1433,9 @@ def cmd_record_plugin_merged(args: argparse.Namespace) -> int:
         main_tip = head_sha
         main_source = "HEAD"
 
-    # Optional ls-remote cross-check (non-fatal if offline; fatal if returns different tip
-    # that does not contain merge — only when ls-remote succeeds).
-    ls = _git("ls-remote", "origin", "refs/heads/main")
+    # Optional ls-remote cross-check (skip/offline on timeout; fatal only when
+    # ls-remote succeeds and returned tip does not contain merge-sha).
+    ls = _git("ls-remote", "origin", "refs/heads/main", timeout=8.0)
     ls_remote_tip = None
     if ls.returncode == 0 and (ls.stdout or "").strip():
         first = (ls.stdout or "").splitlines()[0].split()
