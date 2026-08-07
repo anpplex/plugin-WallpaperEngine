@@ -1,0 +1,126 @@
+{
+  "schemaVersion": "wp12a-manifest-map/v1",
+  "packageName": "io.wallpaperengine.weclient",
+  "apkSha256": "75a4d82a92e511f6a869a11dd39dac1b7e35fffc4d54077da8f10305104b2e4a",
+  "versionCode": 4354,
+  "versionName": "2.8.8",
+  "manifest": {
+    "packageName": "io.wallpaperengine.weclient",
+    "applicationProcess": null,
+    "minSdk": 24,
+    "targetSdk": 34,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "dex": {
+    "count": 2,
+    "entries": [
+      {
+        "name": "classes.dex",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sizeBytes": 1000
+      },
+      {
+        "name": "classes2.dex",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "sizeBytes": 500
+      }
+    ]
+  },
+  "resources": {
+    "arscSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "entries": [
+      {
+        "id": "0x7f010001",
+        "type": "string",
+        "name": "app_name",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      {
+        "id": "0x7f020001",
+        "type": "drawable",
+        "name": "ic_launcher",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    ],
+    "idIndex": {
+      "0x7f010001": "string/app_name",
+      "0x7f020001": "drawable/ic_launcher"
+    }
+  },
+  "authorities": [
+    {
+      "authority": "io.wallpaperengine.weclient.fileprovider",
+      "componentName": "androidx.core.content.FileProvider",
+      "exported": false,
+      "grantUriPermissions": true
+    },
+    {
+      "authority": "io.wallpaperengine.weclient.androidx-startup",
+      "componentName": "androidx.startup.InitializationProvider",
+      "exported": false,
+      "grantUriPermissions": false
+    }
+  ],
+  "permissions": {
+    "declared": [
+      {
+        "name": "io.wallpaperengine.weclient.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+        "protectionLevel": "signature"
+      }
+    ],
+    "uses": [
+      {
+        "name": "android.permission.INTERNET",
+        "maxSdkVersion": null
+      },
+      {
+        "name": "android.permission.SET_WALLPAPER",
+        "maxSdkVersion": null
+      }
+    ],
+    "signatureKnown": [
+      "io.wallpaperengine.weclient.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+    ]
+  },
+  "components": {
+    "activities": [
+      {
+        "name": "io.wallpaperengine.weclient.BrowseActivity",
+        "exported": true,
+        "process": null,
+        "permission": null
+      }
+    ],
+    "services": [
+      {
+        "name": "io.wallpaperengine.weclient.WEWallpaperService",
+        "exported": true,
+        "process": null,
+        "permission": "android.permission.BIND_WALLPAPER"
+      }
+    ],
+    "receivers": [
+      {
+        "name": "io.wallpaperengine.weclient.CarNextReceiver",
+        "exported": false,
+        "process": null,
+        "permission": null
+      }
+    ],
+    "providers": [
+      {
+        "name": "androidx.core.content.FileProvider",
+        "exported": false,
+        "process": null,
+        "permission": null,
+        "authorities": [
+          "io.wallpaperengine.weclient.fileprovider"
+        ]
+      }
+    ]
+  },
+  "failClosed": {
+    "ok": true,
+    "failures": []
+  }
+}
