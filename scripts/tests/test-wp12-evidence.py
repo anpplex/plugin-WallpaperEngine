@@ -525,14 +525,560 @@ class TestCollectSealRed(unittest.TestCase):
             self.assertEqual(seal_ok.returncode, 0, msg=seal_ok.stdout + seal_ok.stderr)
             sealed_payload = parse_json_stdout(seal_ok)
             self.assertFalse(sealed_payload.get("EffectiveDone"))
+            self.assertFalse(sealed_payload.get("inventorySealed"))
 
             sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
             self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertFalse(sealed.get("inventorySealed"))
 
             # progress update must refuse EffectiveDone=false
             prog = run_py(UPDATE_PY, "--task", "WP-12A", "--sealed", str(sealed_out))
             self.assertNotEqual(prog.returncode, 0)
             self.assertEqual(parse_json_stdout(prog).get("failureReason"), "EFFECTIVE_DONE_FALSE")
+
+    def test_seal_v1_fixture_inventory_sealed_effective_done_false(self) -> None:
+        """v1 inventory shapes → inventorySealed=true; EffectiveDone always false."""
+        fixture = PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "manifest-inventory-pass.json"
+        self.assertTrue(fixture.is_file(), f"missing fixture {fixture}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_dir = Path(tmp) / "txns"
+            init = run_py(
+                TXN_PY,
+                "init",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                str(txn_dir),
+                "--local-only",
+            )
+            self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+            txn_path = txn_dir / "wp-12a.json"
+
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "runtime-inventory",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(fixture),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            collect_payload = parse_json_stdout(collect)
+            inv = json.loads(fixture.read_text(encoding="utf-8"))
+            self.assertEqual(collect_payload.get("officialApkSha256"), inv.get("apkSha256"))
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertEqual(raw.get("officialApkSha256"), inv.get("apkSha256"))
+            self.assertIsInstance(raw["inventory"]["authorities"], list)
+            self.assertIsInstance(raw["inventory"]["permissions"], dict)
+            self.assertIn("declared", raw["inventory"]["permissions"])
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_payload = parse_json_stdout(seal)
+            self.assertTrue(seal_payload.get("inventorySealed"))
+            self.assertFalse(seal_payload.get("EffectiveDone"))
+
+            sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+            self.assertTrue(sealed.get("inventorySealed"))
+            self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertIsInstance(sealed["inventory"]["authorities"], list)
+            self.assertIn("declared", sealed["inventory"]["permissions"])
+            self.assertEqual(
+                sealed["hashes"].get("officialApkSha256"),
+                inv.get("apkSha256"),
+            )
+
+            # Wrong APK class when --require-official-sha (fixture sha != official)
+            wrong_out = Path(tmp) / "sealed-require.json"
+            seal_req = run_py(
+                SEAL_PY,
+                "--raw",
+                str(raw_out),
+                "--out",
+                str(wrong_out),
+                "--require-official-sha",
+            )
+            self.assertNotEqual(seal_req.returncode, 0)
+            self.assertEqual(parse_json_stdout(seal_req).get("failureReason"), "WRONG_APK_CLASS")
+
+
+class TestEvidenceDag(unittest.TestCase):
+    """VERIFIED → open-attempt → record-raw → seal-evidence."""
+
+    def _init_and_verify(self, tmp: str) -> Path:
+        init = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12A",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+        for phase in ("RED", "GREEN", "REFACTOR", "VERIFY"):
+            proc = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                phase,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"{phase}: {proc.stdout}{proc.stderr}")
+        status = run_py(TXN_PY, "status", "--task", "WP-12A", "--transactions", tmp)
+        self.assertEqual(parse_json_stdout(status).get("state"), "VERIFIED")
+        return Path(tmp) / "wp-12a.json"
+
+    def test_evidence_slice_happy_path(self) -> None:
+        fixture = PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "manifest-inventory-pass.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_and_verify(tmp)
+
+            open_a = run_py(
+                TXN_PY,
+                "open-attempt",
+                "--task",
+                "WP-12A",
+                "--attempt-no",
+                "1",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(open_a.returncode, 0, msg=open_a.stdout + open_a.stderr)
+            self.assertEqual(parse_json_stdout(open_a).get("state"), "EVIDENCE_ATTEMPT_OPEN")
+
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "runtime-inventory",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(fixture),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            rec = run_py(
+                TXN_PY,
+                "record-raw",
+                "--task",
+                "WP-12A",
+                "--path",
+                str(raw_out),
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(rec.returncode, 0, msg=rec.stdout + rec.stderr)
+            self.assertEqual(parse_json_stdout(rec).get("state"), "RAW_COLLECTED")
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            self.assertTrue(parse_json_stdout(seal).get("inventorySealed"))
+            self.assertFalse(parse_json_stdout(seal).get("EffectiveDone"))
+
+            seal_txn = run_py(
+                TXN_PY,
+                "seal-evidence",
+                "--task",
+                "WP-12A",
+                "--path",
+                str(sealed_out),
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(seal_txn.returncode, 0, msg=seal_txn.stdout + seal_txn.stderr)
+            payload = parse_json_stdout(seal_txn)
+            self.assertEqual(payload.get("state"), "EVIDENCE_SEALED")
+            self.assertTrue(payload.get("inventorySealed"))
+            self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "EVIDENCE_SEALED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            self.assertEqual(len(receipt.get("attempts") or []), 1)
+            self.assertTrue(receipt["attempts"][0].get("inventorySealed"))
+
+    def test_open_attempt_before_verified_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            init = run_py(
+                TXN_PY,
+                "init",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--local-only",
+            )
+            self.assertEqual(init.returncode, 0)
+            open_a = run_py(
+                TXN_PY,
+                "open-attempt",
+                "--task",
+                "WP-12A",
+                "--attempt-no",
+                "1",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(open_a.returncode, 0)
+            self.assertEqual(parse_json_stdout(open_a).get("failureReason"), "OUT_OF_ORDER_EVIDENCE")
+
+
+class TestPluginLegBookkeeping(unittest.TestCase):
+    """Plugin prepare/commit dry-run bookkeeping (no auto git commit, no DONE)."""
+
+    # PR #9 merge on origin/main — already contains WP-12 allowlist paths.
+    MERGED_SHA = "4255a9f16141818ba0beeab9bde1eddb0f862c31"
+    FEAT_SHA = "e35250f1b5da38f685acabd5121698195dd683bb"
+
+    def _init_and_verify(self, tmp: str) -> Path:
+        init = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12A",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+        for phase in ("RED", "GREEN", "REFACTOR", "VERIFY"):
+            proc = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                phase,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"{phase}: {proc.stdout}{proc.stderr}")
+        status = run_py(TXN_PY, "status", "--task", "WP-12A", "--transactions", tmp)
+        self.assertEqual(parse_json_stdout(status).get("state"), "VERIFIED")
+        return Path(tmp) / "wp-12a.json"
+
+    def test_prepare_and_commit_plugin_happy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_and_verify(tmp)
+
+            prep = run_py(
+                TXN_PY,
+                "prepare-plugin",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(prep.returncode, 0, msg=prep.stdout + prep.stderr)
+            prep_payload = parse_json_stdout(prep)
+            self.assertEqual(prep_payload.get("state"), "PLUGIN_PREPARED")
+            self.assertFalse(prep_payload.get("EffectiveDone"))
+            self.assertTrue(prep_payload.get("preparedTree"))
+            self.assertTrue(prep_payload.get("headSha"))
+
+            commit = run_py(
+                TXN_PY,
+                "commit-plugin",
+                "--task",
+                "WP-12A",
+                "--commit-sha",
+                self.FEAT_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(commit.returncode, 0, msg=commit.stdout + commit.stderr)
+            commit_payload = parse_json_stdout(commit)
+            self.assertEqual(commit_payload.get("state"), "PLUGIN_COMMITTED")
+            self.assertFalse(commit_payload.get("EffectiveDone"))
+            self.assertEqual(commit_payload.get("commitSha"), self.FEAT_SHA)
+            self.assertTrue(str(commit_payload.get("subject", "")).startswith("feat(wp12)"))
+
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "PLUGIN_COMMITTED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            self.assertEqual(receipt["pluginCommit"]["commitSha"], self.FEAT_SHA)
+            self.assertEqual(receipt["legs"]["plugin"]["state"], "PLUGIN_COMMITTED")
+
+            # Cannot jump to DONE from PLUGIN_COMMITTED via assert
+            done = run_py(
+                TXN_PY,
+                "assert-state",
+                "--task",
+                "WP-12A",
+                "--expected",
+                "DONE",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(done.returncode, 0)
+            self.assertEqual(parse_json_stdout(done).get("failureReason"), "ILLEGAL_STATE")
+
+    def test_record_plugin_merged_from_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_and_verify(tmp)
+            merged = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12A",
+                "--merge-sha",
+                self.MERGED_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(merged.returncode, 0, msg=merged.stdout + merged.stderr)
+            payload = parse_json_stdout(merged)
+            self.assertEqual(payload.get("state"), "PLUGIN_COMMITTED")
+            self.assertFalse(payload.get("EffectiveDone"))
+            self.assertEqual(payload.get("mergeSha"), self.MERGED_SHA)
+            self.assertIn("PR #8/#9", payload.get("note") or "")
+
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "PLUGIN_COMMITTED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            self.assertEqual(receipt["pluginCommit"]["mode"], "record-plugin-merged")
+            self.assertIsNotNone(receipt.get("pluginPrepare"))
+
+    def test_prepare_plugin_with_prepared_tree(self) -> None:
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(PLUGIN_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(tree.returncode, 0, msg=tree.stderr)
+        tree_sha = tree.stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_and_verify(tmp)
+            prep = run_py(
+                TXN_PY,
+                "prepare-plugin",
+                "--task",
+                "WP-12A",
+                "--prepared-tree",
+                tree_sha,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(prep.returncode, 0, msg=prep.stdout + prep.stderr)
+            payload = parse_json_stdout(prep)
+            self.assertEqual(payload.get("state"), "PLUGIN_PREPARED")
+            self.assertEqual(payload.get("preparedTree"), tree_sha)
+            self.assertEqual(payload.get("mode"), "prepared-tree")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+    def test_out_of_order_prepare_plugin_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            init = run_py(
+                TXN_PY,
+                "init",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--local-only",
+            )
+            self.assertEqual(init.returncode, 0)
+            prep = run_py(
+                TXN_PY,
+                "prepare-plugin",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(prep.returncode, 0)
+            self.assertEqual(parse_json_stdout(prep).get("failureReason"), "OUT_OF_ORDER_PLUGIN")
+
+            # commit-plugin also out of order from TREE_FROZEN
+            commit = run_py(
+                TXN_PY,
+                "commit-plugin",
+                "--task",
+                "WP-12A",
+                "--commit-sha",
+                self.FEAT_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(commit.returncode, 0)
+            self.assertEqual(parse_json_stdout(commit).get("failureReason"), "OUT_OF_ORDER_PLUGIN")
+
+            # record-plugin-merged out of order
+            merged = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12A",
+                "--merge-sha",
+                self.MERGED_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(merged.returncode, 0)
+            self.assertEqual(parse_json_stdout(merged).get("failureReason"), "OUT_OF_ORDER_PLUGIN")
+
+    def test_commit_plugin_requires_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_and_verify(tmp)
+            commit = run_py(
+                TXN_PY,
+                "commit-plugin",
+                "--task",
+                "WP-12A",
+                "--commit-sha",
+                self.FEAT_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(commit.returncode, 0)
+            self.assertEqual(parse_json_stdout(commit).get("failureReason"), "OUT_OF_ORDER_PLUGIN")
+
+    def test_plugin_committed_does_not_set_effective_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_and_verify(tmp)
+            merged = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12A",
+                "--merge-sha",
+                "4255a9f",  # short form
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(merged.returncode, 0, msg=merged.stdout + merged.stderr)
+            payload = parse_json_stdout(merged)
+            self.assertEqual(payload.get("state"), "PLUGIN_COMMITTED")
+            self.assertIs(payload.get("EffectiveDone"), False)
+
+            # declare-done still forbidden
+            decl = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12A",
+                "--merge-sha",
+                self.MERGED_SHA,
+                "--declare-done",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(decl.returncode, 0)
+            # already PLUGIN_COMMITTED → out of order OR declare-done first
+            reason = parse_json_stdout(decl).get("failureReason")
+            self.assertIn(reason, {"CALLER_DECLARED_DONE", "OUT_OF_ORDER_PLUGIN", "ALREADY_DONE_OR_FORGED"})
+
+    def test_prepare_after_evidence_sealed_tolerated(self) -> None:
+        """EVIDENCE_SEALED is a valid prereq for prepare-plugin (attach tolerate)."""
+        fixture = PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "manifest-inventory-pass.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_and_verify(tmp)
+            open_a = run_py(
+                TXN_PY,
+                "open-attempt",
+                "--task",
+                "WP-12A",
+                "--attempt-no",
+                "1",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(open_a.returncode, 0, msg=open_a.stdout + open_a.stderr)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "runtime-inventory",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(fixture),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            rec = run_py(
+                TXN_PY,
+                "record-raw",
+                "--task",
+                "WP-12A",
+                "--path",
+                str(raw_out),
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(rec.returncode, 0, msg=rec.stdout + rec.stderr)
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_txn = run_py(
+                TXN_PY,
+                "seal-evidence",
+                "--task",
+                "WP-12A",
+                "--path",
+                str(sealed_out),
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(seal_txn.returncode, 0, msg=seal_txn.stdout + seal_txn.stderr)
+            self.assertEqual(parse_json_stdout(seal_txn).get("state"), "EVIDENCE_SEALED")
+
+            prep = run_py(
+                TXN_PY,
+                "prepare-plugin",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(prep.returncode, 0, msg=prep.stdout + prep.stderr)
+            self.assertEqual(parse_json_stdout(prep).get("state"), "PLUGIN_PREPARED")
+            self.assertFalse(parse_json_stdout(prep).get("EffectiveDone"))
+
+            merged = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12A",
+                "--merge-sha",
+                self.MERGED_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(merged.returncode, 0, msg=merged.stdout + merged.stderr)
+            payload = parse_json_stdout(merged)
+            self.assertEqual(payload.get("state"), "PLUGIN_COMMITTED")
+            self.assertFalse(payload.get("EffectiveDone"))
 
 
 if __name__ == "__main__":

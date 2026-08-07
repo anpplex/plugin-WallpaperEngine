@@ -80,12 +80,15 @@
           "description": "Resource ID / collision inventory"
         },
         "authorities": {
-          "type": "object",
-          "description": "ContentProvider authority map"
+          "description": "ContentProvider authority map (v1 array or legacy object)",
+          "oneOf": [
+            {"type": "array"},
+            {"type": "object"}
+          ]
         },
         "permissions": {
           "type": "object",
-          "description": "Declared / signature permission inventory"
+          "description": "Declared / signature permission inventory (v1: declared/uses)"
         }
       }
     },
@@ -101,9 +104,21 @@
       "type": ["string", "null"],
       "description": "Catalog failureSignature for RED evidence; null on GREEN seal"
     },
+    "inventorySealed": {
+      "type": "boolean",
+      "description": "True when non-stub v1 inventory keys and shapes validate"
+    },
+    "inventorySchemaVersion": {
+      "type": ["string", "null"],
+      "description": "Copied from inventory.schemaVersion when present"
+    },
+    "failClosed": {
+      "type": "object",
+      "description": "Desensitized failClosed summary from inventory when present"
+    },
     "EffectiveDone": {
       "type": "boolean",
-      "description": "Must be runner-derived; callers cannot forge true without seal path"
+      "description": "Task EffectiveDone is verify-done only; sealer always writes false"
     },
     "notes": {
       "type": "array",

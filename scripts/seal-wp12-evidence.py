@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""WP-12 evidence sealer (scaffold; fail-closed).
+"""WP-12 evidence sealer (fail-closed).
 
 Usage:
   seal-wp12-evidence.py --raw PATH --out PATH [--schema PATH]
+                        [--allow-stub] [--require-official-sha]
 
 Validates raw collect output has required inventory keys; writes sealed
-manifest with EffectiveDone only when inventory is complete and non-stub.
+manifest. Task EffectiveDone is NEVER claimed from inventory seal alone
+(verify-done only). inventorySealed=true when v1 inventory is complete.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from typing import Any, NoReturn
 EXIT_FAIL = 2
 SEAL_SCHEMA = "wp12-evidence/v1"
 REQUIRED_INVENTORY = ("manifest", "dex", "resources", "authorities", "permissions")
+# Official WE client class used by WP-12A inventory runs.
+OFFICIAL_APK_SHA256 = "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SCHEMA = PLUGIN_ROOT / "runtime-import" / "wp12-evidence.schema.json"
 
@@ -47,6 +51,113 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _nonempty_dict(value: Any) -> bool:
+    return isinstance(value, dict) and len(value) > 0
+
+
+def _nonempty_list(value: Any) -> bool:
+    return isinstance(value, list) and len(value) > 0
+
+
+def validate_v1_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
+    """Return list of shape errors for wp12a-manifest-map/v1 inventory fields.
+
+    Accepts:
+      - authorities: array (v1) or non-empty object (legacy scaffold)
+      - permissions: object with declared/uses (v1) or non-empty object
+      - dex / resources / manifest: objects with substantive content
+    """
+    errors: list[str] = []
+
+    manifest = inventory.get("manifest")
+    if not _nonempty_dict(manifest):
+        errors.append("manifest must be non-empty object")
+
+    dex = inventory.get("dex")
+    if not isinstance(dex, dict):
+        errors.append("dex must be object")
+    elif not (dex.get("entries") or dex.get("count") is not None or len(dex) > 0):
+        errors.append("dex must have entries/count or substantive keys")
+
+    resources = inventory.get("resources")
+    if not isinstance(resources, dict):
+        errors.append("resources must be object")
+    elif not (
+        resources.get("entries") is not None
+        or resources.get("arscSha256")
+        or resources.get("idIndex") is not None
+        or len(resources) > 0
+    ):
+        errors.append("resources must have entries/arscSha256/idIndex or substantive keys")
+
+    authorities = inventory.get("authorities")
+    if isinstance(authorities, list):
+        if len(authorities) == 0:
+            errors.append("authorities array is empty")
+    elif isinstance(authorities, dict):
+        if len(authorities) == 0:
+            errors.append("authorities object is empty")
+    else:
+        errors.append("authorities must be array (v1) or object")
+
+    permissions = inventory.get("permissions")
+    if not isinstance(permissions, dict):
+        errors.append("permissions must be object")
+    else:
+        # v1: declared/uses lists; also accept non-empty legacy maps
+        has_declared = "declared" in permissions
+        has_uses = "uses" in permissions
+        if has_declared or has_uses:
+            if has_declared and not isinstance(permissions.get("declared"), list):
+                errors.append("permissions.declared must be list")
+            if has_uses and not isinstance(permissions.get("uses"), list):
+                errors.append("permissions.uses must be list")
+            if has_declared and has_uses:
+                if len(permissions.get("declared") or []) == 0 and len(permissions.get("uses") or []) == 0:
+                    errors.append("permissions.declared and permissions.uses are both empty")
+        elif len(permissions) == 0:
+            errors.append("permissions object is empty")
+
+    return errors
+
+
+def inventory_is_complete(inventory: dict[str, Any], *, is_stub: bool) -> bool:
+    if is_stub:
+        return False
+    missing = [k for k in REQUIRED_INVENTORY if k not in inventory]
+    if missing:
+        return False
+    return len(validate_v1_inventory_shapes(inventory)) == 0
+
+
+def slice_inventory_for_seal(inventory: dict[str, Any]) -> dict[str, Any]:
+    """Preserve v1 shapes (authorities array; permissions declared/uses)."""
+    authorities = inventory.get("authorities")
+    if authorities is None:
+        authorities = []
+    permissions = inventory.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+    return {
+        "manifest": inventory.get("manifest") if isinstance(inventory.get("manifest"), dict) else {},
+        "dex": inventory.get("dex") if isinstance(inventory.get("dex"), dict) else {},
+        "resources": inventory.get("resources") if isinstance(inventory.get("resources"), dict) else {},
+        "authorities": authorities,
+        "permissions": permissions,
+    }
+
+
+def resolve_apk_sha(raw: dict[str, Any], inventory: dict[str, Any]) -> str | None:
+    for candidate in (
+        raw.get("officialApkSha256"),
+        inventory.get("apkSha256"),
+        (raw.get("hashes") or {}).get("officialApkSha256") if isinstance(raw.get("hashes"), dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="seal-wp12-evidence.py")
     parser.add_argument("--raw", required=True, help="raw collect JSON path")
@@ -55,7 +166,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--allow-stub",
         action="store_true",
-        help="seal stub inventory for dry-run only (EffectiveDone stays false)",
+        help="seal stub inventory for dry-run only (inventorySealed stays false)",
+    )
+    parser.add_argument(
+        "--require-official-sha",
+        action="store_true",
+        help=f"fail-closed if apkSha256 present and != {OFFICIAL_APK_SHA256[:12]}…",
+    )
+    parser.add_argument(
+        "--official-sha",
+        default=OFFICIAL_APK_SHA256,
+        help="expected official APK sha256 when --require-official-sha is set",
     )
     args = parser.parse_args(argv)
 
@@ -101,13 +222,39 @@ def main(argv: list[str]) -> int:
             "refusing to seal STUB_PENDING_IMPORT without --allow-stub",
         )
 
-    # EffectiveDone only when non-stub and inventory values are non-empty objects
-    # with at least one substantive key each (scaffold bar).
-    substantive = all(
-        isinstance(inventory.get(k), dict) and len(inventory.get(k) or {}) > 0
-        for k in REQUIRED_INVENTORY
-    )
-    effective_done = bool(substantive and not is_stub)
+    shape_errors = validate_v1_inventory_shapes(inventory) if not is_stub else []
+    if shape_errors and not is_stub:
+        emit_failure(
+            "INVENTORY_SHAPE_INVALID",
+            "; ".join(shape_errors),
+        )
+
+    # failClosed.ok must not be false when present
+    fail_closed = inventory.get("failClosed")
+    if isinstance(fail_closed, dict) and fail_closed.get("ok") is False:
+        emit_failure(
+            "FAIL_CLOSED_NOT_OK",
+            f"inventory.failClosed.ok is false: {fail_closed.get('failures')}",
+        )
+
+    apk_sha = resolve_apk_sha(raw, inventory)
+    if args.require_official_sha:
+        expected = (args.official_sha or OFFICIAL_APK_SHA256).lower()
+        if apk_sha:
+            if apk_sha.lower() != expected:
+                emit_failure(
+                    "WRONG_APK_CLASS",
+                    f"apkSha256 {apk_sha} != official {expected}",
+                )
+        else:
+            emit_failure(
+                "MISSING_APK_SHA",
+                " --require-official-sha needs officialApkSha256 or inventory.apkSha256",
+            )
+
+    inventory_sealed = inventory_is_complete(inventory, is_stub=is_stub)
+    # Task EffectiveDone is verify-done only — never claimed from inventory seal.
+    effective_done = False
 
     raw_bytes = raw_path.read_bytes()
     sealed = {
@@ -119,28 +266,29 @@ def main(argv: list[str]) -> int:
         "attemptNo": raw["attemptNo"],
         "sealedAt": utc_now_iso(),
         "pluginCommitSha": raw.get("pluginCommitSha"),
-        "inventory": {
-            "manifest": inventory.get("manifest") or {},
-            "dex": inventory.get("dex") or {},
-            "resources": inventory.get("resources") or {},
-            "authorities": inventory.get("authorities") or {},
-            "permissions": inventory.get("permissions") or {},
-        },
+        "inventory": slice_inventory_for_seal(inventory),
         "hashes": {
             "rawSha256": sha256_bytes(raw_bytes),
         },
         "failureSignature": raw.get("failureSignature"),
+        "inventorySealed": inventory_sealed,
         "EffectiveDone": effective_done,
         "notes": [
-            "Scaffold sealer.",
-            "EffectiveDone requires non-stub substantive inventory.",
+            "Sealer: inventorySealed reflects complete non-stub v1 inventory.",
+            "EffectiveDone is always false here; task EffectiveDone is verify-done only.",
         ],
     }
     if is_stub:
-        sealed["notes"].append("sealed with --allow-stub; EffectiveDone=false")
-
-    if raw.get("officialApkSha256"):
-        sealed["hashes"]["officialApkSha256"] = raw["officialApkSha256"]
+        sealed["notes"].append("sealed with --allow-stub; inventorySealed=false EffectiveDone=false")
+    if apk_sha:
+        sealed["hashes"]["officialApkSha256"] = apk_sha
+    if inventory.get("schemaVersion"):
+        sealed["inventorySchemaVersion"] = inventory.get("schemaVersion")
+    if isinstance(fail_closed, dict):
+        sealed["failClosed"] = {
+            "ok": bool(fail_closed.get("ok")),
+            "failureCount": len(fail_closed.get("failures") or []),
+        }
 
     payload = (json.dumps(sealed, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
     sealed["hashes"]["sealedManifestSha256"] = sha256_bytes(payload)
@@ -161,9 +309,11 @@ def main(argv: list[str]) -> int:
     return emit_ok(
         "seal",
         out=str(out),
+        inventorySealed=inventory_sealed,
         EffectiveDone=effective_done,
         stub=is_stub,
         attemptNo=raw["attemptNo"],
+        officialApkSha256=apk_sha,
     )
 
 
