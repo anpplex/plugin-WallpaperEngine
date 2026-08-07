@@ -119,7 +119,7 @@ PHASE_PREREQ = {
     "VERIFY": "REFACTOR_RECORDED",
 }
 
-# Catalog-aligned frozen argv for WP-12A/B (plugin-root relative).
+# Catalog-aligned frozen argv for WP-12A/B/C (plugin-root relative).
 # Prefer hardcode over heavy catalog load; matches experimental catalog intent.
 DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
     "WP-12A": {
@@ -148,17 +148,36 @@ DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
         "REFACTOR": ["true"],
         "VERIFY": ["bash", "scripts/tests/test-native-libs.sh"],
     },
+    "WP-12C": {
+        "RED": [
+            "bash",
+            "scripts/verify-embedded-adapter.sh",
+            "--case",
+            "adapter-negative",
+        ],
+        "GREEN": [
+            "bash",
+            "scripts/verify-embedded-adapter.sh",
+            "--case",
+            "adapter-positive",
+        ],
+        "REFACTOR": ["true"],
+        "VERIFY": ["bash", "scripts/tests/test-embedded-adapter.sh"],
+    },
 }
 
 # RED expected stderr token / failureSignature (primary catalog RED per task).
 DEFAULT_RED_SIGNATURE: dict[str, str] = {
     "WP-12A": "MISSING_DEX",
     "WP-12B": "MISSING_NEEDED",
+    # WP-12C primary RED among UNKNOWN_METHOD / CALLER_APPENDED_ARGS / FALLBACK_MASQUERADE
+    "WP-12C": "UNKNOWN_METHOD",
 }
 
 # Plugin-leg allowlist paths that must exist at a recorded commit/tree (repo-relative).
 # WP-12A: product files on origin/main via PR #8/#9.
 # WP-12B: catalog exactFiles + evidence/transaction tooling on origin/main via PR #12/#14.
+# WP-12C: catalog exactFiles (EmbeddedEngineAdapter / harness).
 PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "WP-12A": (
         "runtime-import/wp12-evidence.schema.json",
@@ -184,12 +203,22 @@ PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
         "scripts/collect-wp12-evidence.py",
         "scripts/seal-wp12-evidence.py",
     ),
+    "WP-12C": (
+        "app/src/main/java/com/motif/wallpaperengine/plugin/EngineAdapter.kt",
+        "app/src/main/java/com/motif/wallpaperengine/plugin/EmbeddedEngineAdapter.kt",
+        "app/src/main/java/com/motif/wallpaperengine/plugin/EmbeddedPreviewActivity.kt",
+        "app/src/test/java/com/motif/wallpaperengine/plugin/EmbeddedEngineAdapterTest.kt",
+        "app/src/test/java/com/motif/wallpaperengine/plugin/EmbeddedEngineAdapterNegativeTest.kt",
+        "scripts/verify-embedded-adapter.sh",
+        "scripts/tests/test-embedded-adapter.sh",
+    ),
 }
 
 # Commit subject allowlist for commit-plugin (prefix match, case-sensitive).
 PLUGIN_COMMIT_SUBJECT_PREFIXES: tuple[str, ...] = (
     "feat(wp12a)",
     "feat(wp12b)",
+    "feat(wp12c)",
     "feat(wp12)",
     "Merge pull request",  # already-merged PR tips (e.g. #8/#9/#12/#14)
 )

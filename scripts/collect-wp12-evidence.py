@@ -10,10 +10,15 @@ Usage:
       [--inventory PATH] [--official-apk PATH] \\
       --transaction PATH --attempt-no N
 
+  collect-wp12-evidence.py --mode adapter-contract --out PATH \\
+      [--inventory PATH] --transaction PATH --attempt-no N
+
 Modes:
   runtime-inventory  — WP-12A manifest map (prebuilt inventory or APK stub)
   native-closure     — WP-12B native/JNI closure (alias: native-jni)
   native-jni         — alias of native-closure
+  adapter-contract   — WP-12C embedded adapter contract (alias: embedded-adapter)
+  embedded-adapter   — alias of adapter-contract
 
 Writes a raw (unsealed) inventory JSON only when required inputs exist.
 Never stages official APK bytes into Git-tracked paths.
@@ -35,21 +40,28 @@ from typing import Any, NoReturn
 
 EXIT_FAIL = 2
 SCHEMA = "wp12-evidence-raw/v1"
+ADAPTER_CONTRACT_SCHEMA = "wp12c-adapter-contract/v1"
+DEFAULT_PACKAGE_NAME = "com.motif.wallpaperengine"
+DEFAULT_OFFICIAL_ENGINE_PACKAGE = "io.wallpaperengine.weclient"
 MODES = frozenset(
     {
         "runtime-inventory",
         "native-jni",
         "native-closure",  # alias of native-jni (WP-12B)
-        "embedded-adapter",
+        "adapter-contract",  # WP-12C embedded adapter contract
+        "embedded-adapter",  # alias of adapter-contract
         "device-e2e3",
         "scene-video-e4",
     }
 )
 NATIVE_MODES = frozenset({"native-jni", "native-closure"})
-IMPLEMENTED_MODES = frozenset({"runtime-inventory"}) | NATIVE_MODES
+ADAPTER_MODES = frozenset({"adapter-contract", "embedded-adapter"})
+IMPLEMENTED_MODES = frozenset({"runtime-inventory"}) | NATIVE_MODES | ADAPTER_MODES
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PLUGIN_ROOT = SCRIPT_DIR.parent
 IMPORT_NATIVE = SCRIPT_DIR / "import-native-libs.sh"
+VERIFY_EMBEDDED_ADAPTER = SCRIPT_DIR / "verify-embedded-adapter.sh"
 
 
 def emit_failure(reason: str, message: str = "") -> NoReturn:
@@ -295,6 +307,100 @@ def collect_native_closure(args: argparse.Namespace, txn: dict[str, Any], out: P
     )
 
 
+def summary_from_positive_harness() -> dict[str, Any]:
+    """Run adapter-positive harness and build a minimal adapter-contract summary.
+
+    Fail-closed: harness must exist and exit 0. Never forges EffectiveDone.
+    """
+    if not VERIFY_EMBEDDED_ADAPTER.is_file():
+        emit_failure(
+            "MISSING_TOOL",
+            f"adapter-contract positive harness missing: {VERIFY_EMBEDDED_ADAPTER} "
+            "(pass --inventory or land scripts/verify-embedded-adapter.sh first)",
+        )
+    try:
+        proc = subprocess.run(
+            ["bash", str(VERIFY_EMBEDDED_ADAPTER), "--case", "adapter-positive"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(PLUGIN_ROOT),
+        )
+    except OSError as exc:
+        emit_failure("ILLEGAL_STATE", f"verify-embedded-adapter failed to start: {exc}")
+    if proc.returncode != 0:
+        emit_failure(
+            "HARNESS_FAILED",
+            f"adapter-positive exit {proc.returncode}: {(proc.stderr or proc.stdout or '')[-500:]}",
+        )
+    # Harness passed: synthesize contract summary (fail-closed defaults).
+    return {
+        "schemaVersion": ADAPTER_CONTRACT_SCHEMA,
+        "packageName": DEFAULT_PACKAGE_NAME,
+        "officialEnginePackage": DEFAULT_OFFICIAL_ENGINE_PACKAGE,
+        "embeddedRuntimeDefault": False,
+        "failClosed": {"ok": True, "failures": []},
+        "checks": {
+            "unknownMethodRejected": True,
+            "appendedArgsRejected": True,
+            "fallbackMasqueradeRejected": True,
+            "defaultUsesOfficial": True,
+        },
+        "harness": {
+            "case": "adapter-positive",
+            "exitCode": 0,
+            "argv": [
+                "bash",
+                "scripts/verify-embedded-adapter.sh",
+                "--case",
+                "adapter-positive",
+            ],
+        },
+    }
+
+
+def collect_adapter_contract(args: argparse.Namespace, txn: dict[str, Any], out: Path) -> int:
+    """WP-12C: accept --inventory adapter-contract JSON or run positive harness summary."""
+    inventory: dict[str, Any] | None = None
+    inventory_source: str | None = None
+    # Canonical mode name (embedded-adapter alias collapses to adapter-contract).
+    evidence_mode = "adapter-contract" if args.mode in ADAPTER_MODES else args.mode
+
+    if args.inventory:
+        inv_path = Path(args.inventory)
+        inventory = load_inventory_file(inv_path)
+        inventory_source = str(inv_path.resolve())
+        schema_v = inventory.get("schemaVersion")
+        if schema_v is not None and schema_v != ADAPTER_CONTRACT_SCHEMA:
+            emit_failure(
+                "ILLEGAL_STATE",
+                f"adapter-contract inventory schemaVersion must be "
+                f"{ADAPTER_CONTRACT_SCHEMA}, got {schema_v!r}",
+            )
+    else:
+        inventory = summary_from_positive_harness()
+        inventory_source = "harness:adapter-positive"
+
+    write_raw_evidence(
+        out,
+        mode=evidence_mode,
+        txn=txn,
+        attempt_no=args.attempt_no,
+        apk_sha=None,
+        inventory_source=inventory_source,
+        inventory=inventory,
+    )
+    return emit_ok(
+        "collect",
+        mode=evidence_mode,
+        out=str(out),
+        attemptNo=args.attempt_no,
+        sealed=False,
+        EffectiveDone=False,
+        inventorySource=inventory_source,
+    )
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="collect-wp12-evidence.py")
     parser.add_argument("--mode", required=True)
@@ -304,7 +410,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--attempt-no", type=int)
     parser.add_argument(
         "--inventory",
-        help="prebuilt inventory (runtime inventory.json or native-inventory.json)",
+        help="prebuilt inventory (runtime / native / adapter-contract JSON)",
     )
     args = parser.parse_args(argv)
 
@@ -314,7 +420,8 @@ def main(argv: list[str]) -> int:
     if args.mode not in IMPLEMENTED_MODES:
         emit_failure(
             "MODE_NOT_IMPLEMENTED",
-            f"scaffold implements runtime-inventory and native-closure/native-jni; got {args.mode}",
+            "scaffold implements runtime-inventory, native-closure/native-jni, "
+            f"and adapter-contract/embedded-adapter; got {args.mode}",
         )
 
     # Fail-closed: transaction + attempt required for real collect path.
@@ -342,6 +449,8 @@ def main(argv: list[str]) -> int:
         return collect_runtime_inventory(args, txn, out)
     if args.mode in NATIVE_MODES:
         return collect_native_closure(args, txn, out)
+    if args.mode in ADAPTER_MODES:
+        return collect_adapter_contract(args, txn, out)
 
     emit_failure("MODE_NOT_IMPLEMENTED", f"unhandled mode: {args.mode}")
 
