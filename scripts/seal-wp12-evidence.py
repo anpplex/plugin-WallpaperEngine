@@ -581,6 +581,36 @@ def slice_inventory_for_seal(
             sliced_device["deviceOnline"] = inventory.get("deviceOnline")
         if isinstance(inventory.get("packageIdentities"), dict):
             sliced_device["packageIdentities"] = dict(inventory.get("packageIdentities") or {})
+        # Preserve live e2-e3 observation fields when present (no APK/SO bytes).
+        if isinstance(inventory.get("deviceE3Claim"), bool):
+            sliced_device["deviceE3Claim"] = inventory.get("deviceE3Claim")
+        if isinstance(inventory.get("targetUser"), int) and not isinstance(
+            inventory.get("targetUser"), bool
+        ):
+            sliced_device["targetUser"] = inventory.get("targetUser")
+        if isinstance(inventory.get("observedUser"), int) and not isinstance(
+            inventory.get("observedUser"), bool
+        ):
+            sliced_device["observedUser"] = inventory.get("observedUser")
+        if isinstance(inventory.get("officialNotEmbeddedHost"), bool):
+            sliced_device["officialNotEmbeddedHost"] = inventory.get(
+                "officialNotEmbeddedHost"
+            )
+        if isinstance(inventory.get("pluginPid"), int) and not isinstance(
+            inventory.get("pluginPid"), bool
+        ):
+            sliced_device["pluginPid"] = inventory.get("pluginPid")
+        if isinstance(inventory.get("surface"), dict):
+            sliced_device["surface"] = dict(inventory.get("surface") or {})
+        if isinstance(inventory.get("surfacePresent"), bool):
+            sliced_device["surfacePresent"] = inventory.get("surfacePresent")
+        if isinstance(inventory.get("realCaller"), dict):
+            sliced_device["realCaller"] = dict(inventory.get("realCaller") or {})
+        if isinstance(inventory.get("apkPresent"), dict):
+            sliced_device["apkPresent"] = dict(inventory.get("apkPresent") or {})
+        if isinstance(inventory.get("signatures"), dict):
+            # Hex digests only (from local APK sha256); never binary.
+            sliced_device["signatures"] = dict(inventory.get("signatures") or {})
         return sliced_device
 
     if adapter:

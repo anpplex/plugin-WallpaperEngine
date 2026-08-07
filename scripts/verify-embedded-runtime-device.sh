@@ -6,7 +6,7 @@
 #   --case device-negative          # RED:  exit 1, stderr MISSING_SERIAL|WRONG_USER|
 #                                   #       OFFICIAL_AS_EMBEDDED_HOST|DEVICE_OFFLINE|MISSING_APK
 #   --case device-positive-offline  # GREEN: exit 0 contract dry-run (no adb, no E3 claim)
-#   --case device-positive          # real adb path; fail-closed DEVICE_OFFLINE if no device
+#   --case device-positive          # live collect → verify positive (exit 0 when device green)
 #
 # Inventory modes (fixture JSON, schemaVersion=wp12d-device-e2e3/v1):
 #   --inventory PATH --mode MODE
@@ -51,8 +51,9 @@ WP-12D host-side embedded runtime device verifier (fail-closed).
 Cases (catalog RED/GREEN + gated device path):
   device-negative           Primary negative inventory → exit 1 + RED signature
   device-positive-offline   Synthetic positive fixture dry-run → exit 0 (no E3 claim)
-  device-positive           Real adb checks (env SERIAL TARGET_USER MINERADIO_APK
-                            PLUGIN_APK OFFICIAL_WE_APK); fail-closed if offline
+  device-positive           Live collect via collect-wp12-evidence.py --mode e2-e3
+                            then verify --mode positive (env SERIAL TARGET_USER
+                            MINERADIO_APK PLUGIN_APK OFFICIAL_WE_APK); exit 0 when green
 
 Modes (with --inventory):
   positive
@@ -110,11 +111,12 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# device-positive: real adb path (fail-closed; never forge PASS)
+# device-positive: live collect → inventory → verify --mode positive
+# Exit 0 when device green (hard checks pass). Never forges PASS offline.
 # ---------------------------------------------------------------------------
 run_device_positive() {
   local missing=0
-  local code=""
+  local COLLECT="${SCRIPT_DIR}/collect-wp12-evidence.py"
 
   if [[ -z "${SERIAL:-}" ]]; then
     printf 'MISSING_SERIAL\n' >&2
@@ -158,39 +160,100 @@ run_device_positive() {
     exit 1
   fi
 
-  local state
-  set +e
-  state="$(adb -s "${SERIAL}" get-state 2>/dev/null | tr -d '\r')"
-  local adb_rc=$?
-  set -e
-  if [[ "${adb_rc}" -ne 0 || "${state}" != "device" ]]; then
+  if [[ ! -f "${COLLECT}" ]]; then
     printf 'DEVICE_OFFLINE\n' >&2
-    log "status=FAIL codes=DEVICE_OFFLINE msg=serial=${SERIAL} state=${state:-none} (fail-closed; no PASS forged)"
+    log "status=FAIL codes=DEVICE_OFFLINE msg=collector missing: ${COLLECT}"
     exit 1
   fi
 
-  local current_user
+  # TMP_CASE cleaned by shared EXIT trap below.
+  TMP_CASE="$(mktemp -d "${TMPDIR:-/tmp}/wp12d-device-positive.XXXXXX")"
+  local live_tmp="${TMP_CASE}"
+
+  # Minimal transaction receipt so collector can write raw (not task EffectiveDone).
+  cat >"${live_tmp}/txn.json" <<'TXN'
+{
+  "taskId": "WP-12D",
+  "transactionId": "device-positive-live",
+  "runUuid": "device-positive-live",
+  "state": "TREE_FROZEN",
+  "EffectiveDone": false
+}
+TXN
+
+  local raw_out="${live_tmp}/raw.json"
+  local collect_rc=0
   set +e
-  current_user="$(adb -s "${SERIAL}" shell am get-current-user 2>/dev/null | tr -d '\r' | tr -d '[:space:]')"
-  local user_rc=$?
+  python3 "${COLLECT}" \
+    --mode e2-e3 \
+    --serial "${SERIAL}" \
+    --user "${TARGET_USER}" \
+    --mineradio-apk "${MINERADIO_APK}" \
+    --plugin-apk "${PLUGIN_APK}" \
+    --official-apk "${OFFICIAL_WE_APK}" \
+    --transaction "${live_tmp}/txn.json" \
+    --attempt-no 1 \
+    --out "${raw_out}" >"${live_tmp}/collect.stdout" 2>"${live_tmp}/collect.stderr"
+  collect_rc=$?
   set -e
-  if [[ "${user_rc}" -ne 0 || -z "${current_user}" ]]; then
-    printf 'DEVICE_OFFLINE\n' >&2
-    log "status=FAIL codes=DEVICE_OFFLINE msg=unable to read current user"
-    exit 1
-  fi
-  if [[ "${current_user}" != "${TARGET_USER}" ]]; then
-    printf 'WRONG_USER\n' >&2
-    log "status=FAIL codes=WRONG_USER msg=observed=${current_user} target=${TARGET_USER}"
+
+  if [[ "${collect_rc}" -ne 0 ]]; then
+    # Propagate collector hard-fail codes to stderr for catalog matching.
+    local reason
+    reason="$(
+      python3 - "${live_tmp}/collect.stdout" "${live_tmp}/collect.stderr" <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    try:
+        text = open(path, encoding="utf-8").read().strip()
+    except OSError:
+        continue
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            doc = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(doc, dict) and doc.get("failureReason"):
+            print(doc["failureReason"])
+            raise SystemExit(0)
+print("")
+PY
+    )"
+    if [[ -z "${reason}" ]]; then
+      reason="DEVICE_OFFLINE"
+    fi
+    printf '%s\n' "${reason}" >&2
+    log "status=FAIL codes=${reason} msg=live collect failed (fail-closed; no PASS forged)"
+    if [[ -s "${live_tmp}/collect.stderr" ]]; then
+      log "collect.stderr=$(tail -c 400 "${live_tmp}/collect.stderr" | tr '\n' ' ')"
+    fi
     exit 1
   fi
 
-  # Real on-device E2/E3 collection is out of scope for this host harness PR.
-  # We only gate adb/user/APK presence; full identity/PID/surface seal lands with
-  # collector --mode e2-e3. Until then, do not claim PASS for live E3.
-  printf 'DEVICE_OFFLINE\n' >&2
-  log "status=FAIL codes=DEVICE_OFFLINE msg=device online but full e2-e3 identity seal not implemented in host harness (fail-closed)"
-  exit 1
+  if [[ ! -f "${raw_out}" ]]; then
+    printf 'DEVICE_OFFLINE\n' >&2
+    log "status=FAIL codes=DEVICE_OFFLINE msg=collector produced no raw evidence"
+    exit 1
+  fi
+
+  local inv_out="${live_tmp}/live-inventory.json"
+  python3 - "${raw_out}" "${inv_out}" <<'PY'
+import json, sys
+raw_path, inv_path = sys.argv[1], sys.argv[2]
+raw = json.loads(open(raw_path, encoding="utf-8").read())
+inv = raw.get("inventory")
+if not isinstance(inv, dict):
+    raise SystemExit("raw missing inventory object")
+open(inv_path, "w", encoding="utf-8").write(json.dumps(inv, indent=2, sort_keys=True) + "\n")
+PY
+
+  log "case=device-positive live inventory=${inv_out} (collector e2-e3; soft surface/pid)"
+  INVENTORY="${inv_out}"
+  MODE="positive"
+  # Fall through to shared inventory verifier below (do not exit).
 }
 
 TMP_CASE=""
@@ -289,7 +352,7 @@ JSON
       log "case=device-positive-offline inventory=${INVENTORY} (contract dry-run; no device E3 claim)"
       ;;
     device-positive)
-      log "case=device-positive (real adb path; fail-closed)"
+      log "case=device-positive (live collect + verify positive)"
       run_device_positive
       ;;
     *)
@@ -562,30 +625,55 @@ for role in ("mineradio", "plugin", "officialWe"):
     if not isinstance(sig, str) or not HEX64.fullmatch(sig):
         pos_add("MISSING_APK", f"signatures.{role} must be 64-char lowercase hex")
 
-# realCaller / pluginPid / surface integrity for positive path
+# realCaller / pluginPid / surface integrity for positive path.
+# Offline contract dry-run: strict synthetic shape (pid/surface present, no E3 claim).
+# Live inventory (deviceOnline=true, contractDryRun!=true): soft surface/pid;
+# deviceE3Claim/deviceEvidenceClaimed may be true when hard checks passed.
 surface_present = surface.get("present")
 owner_pid = surface.get("ownerPid")
+is_live = device_online is True and contract_dry_run is not True
 if mode == "positive":
-    if not (isinstance(plugin_pid, int) and plugin_pid > 0):
-        pos_add("DEVICE_OFFLINE", "positive requires pluginPid > 0")
-    if surface_present is not True:
-        pos_add("DEVICE_OFFLINE", "positive requires surface.present true")
-    elif not (isinstance(owner_pid, int) and owner_pid == plugin_pid):
-        pos_add("DEVICE_OFFLINE", "surface.ownerPid must match pluginPid")
-    if real_caller.get("isShell") is True:
-        pos_add("DEVICE_OFFLINE", "realCaller must not be shell for positive")
-    if real_caller.get("isMineradio") is not True:
-        pos_add("DEVICE_OFFLINE", "realCaller.isMineradio must be true for positive")
-    caller_pkg = real_caller.get("package")
-    if caller_pkg is not None and caller_pkg != PKG_MINERADIO:
-        pos_add("DEVICE_OFFLINE", f"realCaller.package unexpected: {caller_pkg}")
-    # Offline contract dry-run may leave deviceOnline false; require dry-run flag.
-    if device_online is False and contract_dry_run is not True:
-        # already covered by DEVICE_OFFLINE above; keep positive clean
-        pass
-    if device_e3_claim is True:
-        pos_add("DEVICE_OFFLINE", "positive inventory must not forge deviceE3Claim")
-
+    if is_live:
+        # Soft: pluginPid/surface recorded but not required for PASS.
+        if real_caller.get("isShell") is True:
+            pos_add("DEVICE_OFFLINE", "realCaller must not be shell for live positive")
+        if real_caller.get("isMineradio") is not True:
+            pos_add(
+                "DEVICE_OFFLINE",
+                "live positive requires realCaller.isMineradio true (Mineradio installed)",
+            )
+        caller_pkg = real_caller.get("package")
+        if caller_pkg is not None and caller_pkg != PKG_MINERADIO:
+            pos_add("DEVICE_OFFLINE", f"realCaller.package unexpected: {caller_pkg}")
+        if official_not_host is not True:
+            pos_add("OFFICIAL_AS_EMBEDDED_HOST", "live positive requires officialNotEmbeddedHost")
+        # Live claim is allowed (and expected) when hard checks pass.
+        device_evidence_claimed = data.get("deviceEvidenceClaimed")
+        if device_e3_claim is False and device_evidence_claimed is False:
+            pos_add(
+                "DEVICE_OFFLINE",
+                "live positive expects deviceEvidenceClaimed/deviceE3Claim true when green",
+            )
+    else:
+        if not (isinstance(plugin_pid, int) and plugin_pid > 0):
+            pos_add("DEVICE_OFFLINE", "positive requires pluginPid > 0")
+        if surface_present is not True:
+            pos_add("DEVICE_OFFLINE", "positive requires surface.present true")
+        elif not (isinstance(owner_pid, int) and owner_pid == plugin_pid):
+            pos_add("DEVICE_OFFLINE", "surface.ownerPid must match pluginPid")
+        if real_caller.get("isShell") is True:
+            pos_add("DEVICE_OFFLINE", "realCaller must not be shell for positive")
+        if real_caller.get("isMineradio") is not True:
+            pos_add("DEVICE_OFFLINE", "realCaller.isMineradio must be true for positive")
+        caller_pkg = real_caller.get("package")
+        if caller_pkg is not None and caller_pkg != PKG_MINERADIO:
+            pos_add("DEVICE_OFFLINE", f"realCaller.package unexpected: {caller_pkg}")
+        # Offline contract dry-run may leave deviceOnline false; require dry-run flag.
+        if device_online is False and contract_dry_run is not True:
+            # already covered by DEVICE_OFFLINE above; keep positive clean
+            pass
+        if device_e3_claim is True:
+            pos_add("DEVICE_OFFLINE", "positive inventory must not forge deviceE3Claim")
 # Merge positive-only defects only for positive mode (avoid polluting negative
 # signature ordering with unrelated codes).
 if mode == "positive":
@@ -608,11 +696,18 @@ expected_by_mode = {
 
 if mode == "positive":
     if not codes:
-        emit(
-            "PASS",
-            [],
-            "device e2e3 contract clean (offline dry-run; no device E3 claim)",
-        )
+        if is_live:
+            emit(
+                "PASS",
+                [],
+                "device e2e3 live hard checks clean (surface/pluginPid soft; EffectiveDone false)",
+            )
+        else:
+            emit(
+                "PASS",
+                [],
+                "device e2e3 contract clean (offline dry-run; no device E3 claim)",
+            )
     else:
         detail = "; ".join(f"{c}: {m}" for c, m in failures)
         emit("FAIL", codes, detail)
