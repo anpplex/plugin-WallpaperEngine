@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "wp12e-scene-video-e4/v1",
+  "contractDryRun": true,
+  "deviceE4Claim": false,
+  "pluginPid": 8888,
+  "surface": {
+    "present": true,
+    "ownerPid": 8888,
+    "name": "EmbeddedPreview"
+  },
+  "intervalSeconds": 5,
+  "samples": {
+    "scene": {
+      "frames": [
+        {
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "capturedAt": "2026-08-07T12:00:00Z"
+        }
+      ],
+      "nonBlack": true,
+      "nonSolid": true
+    },
+    "video": {
+      "frames": [
+        {
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "capturedAt": "2026-08-07T12:00:05Z"
+        }
+      ],
+      "nonBlack": true,
+      "nonSolid": true
+    }
+  },
+  "failClosed": {
+    "ok": true,
+    "failures": []
+  },
+  "humanReadableOk": true
+}
