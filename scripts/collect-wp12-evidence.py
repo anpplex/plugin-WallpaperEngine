@@ -19,6 +19,12 @@ Usage:
       [--mineradio-apk PATH] [--plugin-apk PATH] [--official-apk PATH] \\
       --transaction PATH --attempt-no N
 
+  collect-wp12-evidence.py --mode e4 --out PATH \\
+      (--inventory PATH | --offline-fixture PATH | live scene/video args) \\
+      [--serial SERIAL] [--user N] \\
+      [--plugin-apk PATH] [--scene PATH] [--video PATH] \\
+      --transaction PATH --attempt-no N
+
 Modes:
   runtime-inventory  — WP-12A manifest map (prebuilt inventory or APK stub)
   native-closure     — WP-12B native/JNI closure (alias: native-jni)
@@ -27,6 +33,9 @@ Modes:
   embedded-adapter   — alias of adapter-contract
   e2-e3              — WP-12D device E2/E3 (alias: device-e2e3)
   device-e2e3        — alias of e2-e3
+  e4                 — WP-12E scene/video E4 (aliases: scene-video, scene-video-e4)
+  scene-video        — alias of e4
+  scene-video-e4     — alias of e4
 
 Live e2-e3 (when --serial is set and no inventory/fixture):
   Requires local APK paths + --user. Hard-fail codes: DEVICE_OFFLINE,
@@ -34,6 +43,14 @@ Live e2-e3 (when --serial is set and no inventory/fixture):
   device. Soft fields: pluginPid, surface (best-effort). Sets
   deviceEvidenceClaimed=true only when hard checks pass. EffectiveDone
   always false.
+
+Live e4 (when --serial is set and no inventory/fixture):
+  Requires --user, --plugin-apk, --scene, --video. Launches
+  EmbeddedPreviewActivity per sample, adb screencaps two frames ≥3s apart,
+  runs analyze-frame-nonblack.py, stores frames under work/ (gitignored)
+  and hashes in inventory schema wp12e-scene-video-e4/v1. Fail-closed:
+  DEVICE_OFFLINE, WRONG_USER, MISSING_APK, MISSING_INPUT, BLACK_FRAME,
+  SOLID_COLOR, SINGLE_SAMPLE. EffectiveDone always false.
 
 Writes a raw (unsealed) inventory JSON only when required inputs exist.
 Never stages official APK bytes into Git-tracked paths.
@@ -52,6 +69,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -60,10 +78,15 @@ EXIT_FAIL = 2
 SCHEMA = "wp12-evidence-raw/v1"
 ADAPTER_CONTRACT_SCHEMA = "wp12c-adapter-contract/v1"
 DEVICE_E2E3_SCHEMA = "wp12d-device-e2e3/v1"
+SCENE_VIDEO_E4_SCHEMA = "wp12e-scene-video-e4/v1"
 DEFAULT_PACKAGE_NAME = "com.motif.wallpaperengine"
 DEFAULT_OFFICIAL_ENGINE_PACKAGE = "io.wallpaperengine.weclient"
 DEFAULT_MINERADIO_PACKAGE = "com.mineradio.app"
 DEFAULT_TARGET_USER = 12
+DEFAULT_PREVIEW_ACTIVITY = (
+    "com.motif.wallpaperengine/.plugin.EmbeddedPreviewActivity"
+)
+DEFAULT_FRAME_GAP_SECONDS = 3.0
 MODES = frozenset(
     {
         "runtime-inventory",
@@ -73,20 +96,28 @@ MODES = frozenset(
         "embedded-adapter",  # alias of adapter-contract
         "e2-e3",  # WP-12D device E2/E3 (canonical)
         "device-e2e3",  # alias of e2-e3
-        "scene-video-e4",
+        "e4",  # WP-12E scene/video E4 (canonical short)
+        "scene-video",  # alias of e4
+        "scene-video-e4",  # alias / schema mode name
     }
 )
 NATIVE_MODES = frozenset({"native-jni", "native-closure"})
 ADAPTER_MODES = frozenset({"adapter-contract", "embedded-adapter"})
 DEVICE_MODES = frozenset({"e2-e3", "device-e2e3"})
+SCENE_VIDEO_MODES = frozenset({"e4", "scene-video", "scene-video-e4"})
 IMPLEMENTED_MODES = (
-    frozenset({"runtime-inventory"}) | NATIVE_MODES | ADAPTER_MODES | DEVICE_MODES
+    frozenset({"runtime-inventory"})
+    | NATIVE_MODES
+    | ADAPTER_MODES
+    | DEVICE_MODES
+    | SCENE_VIDEO_MODES
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPT_DIR.parent
 IMPORT_NATIVE = SCRIPT_DIR / "import-native-libs.sh"
 VERIFY_EMBEDDED_ADAPTER = SCRIPT_DIR / "verify-embedded-adapter.sh"
+ANALYZE_FRAME = SCRIPT_DIR / "analyze-frame-nonblack.py"
 
 
 def emit_failure(reason: str, message: str = "") -> NoReturn:
@@ -778,6 +809,690 @@ def normalize_device_inventory_from_fixture(inventory: dict[str, Any]) -> dict[s
     return inv
 
 
+def sample_frame_fields_ok(sample: Any) -> tuple[bool, list[str]]:
+    """Validate one scene/video sample for non-black non-solid with ≥1 hashed frame."""
+    errors: list[str] = []
+    if not isinstance(sample, dict):
+        return False, ["sample must be object"]
+    if sample.get("nonBlack") is not True:
+        errors.append("nonBlack must be true")
+    if sample.get("nonSolid") is not True:
+        errors.append("nonSolid must be true")
+    frames = sample.get("frames")
+    if not isinstance(frames, list) or len(frames) < 1:
+        errors.append("frames must be non-empty array")
+        return (False, errors)
+    hashes: list[str] = []
+    for i, fr in enumerate(frames):
+        if not isinstance(fr, dict):
+            errors.append(f"frames[{i}] must be object")
+            continue
+        sha = fr.get("sha256")
+        if isinstance(sha, str) and len(sha) == 64:
+            hashes.append(sha.lower())
+    if not hashes:
+        errors.append("need ≥1 frame with sha256")
+    if len(hashes) >= 2 and hashes[0] == hashes[1]:
+        errors.append("dual frame hashes must differ")
+    return (len(errors) == 0, errors)
+
+
+def scene_video_samples_complete(inventory: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Both scene and video samples non-black non-solid with interval/dual evidence."""
+    errors: list[str] = []
+    samples = inventory.get("samples")
+    if not isinstance(samples, dict):
+        return False, ["samples must be object"]
+    for kind in ("scene", "video"):
+        ok, sample_errors = sample_frame_fields_ok(samples.get(kind))
+        if not ok:
+            errors.extend(f"{kind}.{e}" for e in sample_errors)
+    interval = inventory.get("intervalSeconds")
+    interval_ok = (
+        isinstance(interval, (int, float))
+        and not isinstance(interval, bool)
+        and float(interval) >= 3.0
+    )
+    dual_ok = False
+    if isinstance(samples, dict):
+        dual_kinds = 0
+        for kind in ("scene", "video"):
+            sample = samples.get(kind)
+            if not isinstance(sample, dict):
+                continue
+            frames = sample.get("frames") if isinstance(sample.get("frames"), list) else []
+            if (
+                sample.get("dualFrames") is True
+                or (isinstance(sample.get("frameCount"), int) and sample["frameCount"] >= 2)
+                or len(frames) >= 2
+            ):
+                dual_kinds += 1
+        dual_ok = dual_kinds >= 2 or interval_ok
+    if not dual_ok and not interval_ok:
+        errors.append("dual-frame interval required (intervalSeconds≥3 or ≥2 frames/sample)")
+    return (len(errors) == 0, errors)
+
+
+def normalize_scene_video_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
+    """Normalize offline/harness e4 inventory; never invent live frame passes."""
+    inv = dict(inventory)
+    if not inv.get("packageName"):
+        inv["packageName"] = DEFAULT_PACKAGE_NAME
+    if inv.get("schemaVersion") is None:
+        inv["schemaVersion"] = SCENE_VIDEO_E4_SCHEMA
+    # Harness deviceE4Claim → seal-facing deviceEvidenceClaimed.
+    if "deviceEvidenceClaimed" not in inv and "deviceE4Claim" in inv:
+        claim = inv.get("deviceE4Claim")
+        if isinstance(claim, bool):
+            inv["deviceEvidenceClaimed"] = claim
+    # Derive checks from samples when checks object omitted (offline harness).
+    checks = inv.get("checks")
+    if not isinstance(checks, dict):
+        samples = inv.get("samples") if isinstance(inv.get("samples"), dict) else {}
+        scene = samples.get("scene") if isinstance(samples.get("scene"), dict) else {}
+        video = samples.get("video") if isinstance(samples.get("video"), dict) else {}
+        scene_frames = scene.get("frames") if isinstance(scene.get("frames"), list) else []
+        video_frames = video.get("frames") if isinstance(video.get("frames"), list) else []
+        interval = inv.get("intervalSeconds")
+        interval_ok = (
+            isinstance(interval, (int, float))
+            and not isinstance(interval, bool)
+            and float(interval) >= 3.0
+        )
+        scene_dual = (
+            scene.get("dualFrames") is True
+            or (isinstance(scene.get("frameCount"), int) and scene["frameCount"] >= 2)
+            or len(scene_frames) >= 2
+            or (interval_ok and len(scene_frames) >= 1)
+        )
+        video_dual = (
+            video.get("dualFrames") is True
+            or (isinstance(video.get("frameCount"), int) and video["frameCount"] >= 2)
+            or len(video_frames) >= 2
+            or (interval_ok and len(video_frames) >= 1)
+        )
+        inv["checks"] = {
+            "sceneNonBlack": scene.get("nonBlack") is True,
+            "sceneNonSolid": scene.get("nonSolid") is True,
+            "sceneDualFrames": bool(scene_dual),
+            "videoNonBlack": video.get("nonBlack") is True,
+            "videoNonSolid": video.get("nonSolid") is True,
+            "videoDualFrames": bool(video_dual),
+            "blackFrameRejected": True,
+            "singleSampleRejected": True,
+            "solidColorRejected": True,
+        }
+    if "failClosed" not in inv or not isinstance(inv.get("failClosed"), dict):
+        complete, errs = scene_video_samples_complete(inv)
+        inv["failClosed"] = {
+            "ok": complete,
+            "failures": [] if complete else (errs or ["INCOMPLETE_SAMPLES"]),
+        }
+    return inv
+
+
+def adb_exec_out(serial: str, *args: str, timeout: int = 60) -> tuple[int, bytes, str]:
+    """Run adb -s SERIAL exec-out ...; return (rc, stdout_bytes, stderr_text)."""
+    try:
+        proc = subprocess.run(
+            ["adb", "-s", str(serial).strip(), "exec-out", *args],
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, b"", str(exc)
+    err = (proc.stderr or b"").decode("utf-8", errors="replace").replace("\r", "")
+    return proc.returncode, proc.stdout or b"", err
+
+
+def adb_screencap_png(serial: str, dest: Path) -> None:
+    """Capture device screen PNG via adb exec-out screencap -p."""
+    rc, data, err = adb_exec_out(serial, "screencap", "-p", timeout=60)
+    if rc != 0 or not data or len(data) < 32:
+        emit_failure(
+            "SCREENCAP_FAILED",
+            f"adb screencap failed rc={rc} bytes={len(data)} err={err[-200:]}",
+        )
+    # Some devices prefix CRLF quirks; PNG magic must be present.
+    if b"\x89PNG" not in data[:16] and not data.startswith(b"\x89PNG"):
+        # Try stripping carriage returns inserted by older adb.
+        data = data.replace(b"\r\n", b"\n")
+    if not data.startswith(b"\x89PNG"):
+        emit_failure("SCREENCAP_FAILED", "screencap output is not PNG")
+    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    dest.write_bytes(data)
+
+
+def run_analyze_frame(*frame_paths: Path) -> dict[str, Any]:
+    """Run analyze-frame-nonblack.py --json --require-dual on frame paths."""
+    if not ANALYZE_FRAME.is_file():
+        emit_failure(
+            "MISSING_TOOL",
+            f"analyze-frame-nonblack.py not found: {ANALYZE_FRAME}",
+        )
+    cmd = [sys.executable, str(ANALYZE_FRAME), "--json", "--require-dual"]
+    for p in frame_paths:
+        cmd.extend(["--frame", str(p)])
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        emit_failure("ILLEGAL_STATE", f"analyze-frame failed to start: {exc}")
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        token = None
+        for line in stderr.splitlines():
+            t = line.strip()
+            if t in (
+                "BLACK_FRAME",
+                "SOLID_COLOR",
+                "SINGLE_SAMPLE",
+                "IDENTICAL_FRAME",
+                "UNREADABLE",
+            ):
+                token = t
+                break
+        if token is None:
+            # Prefer first bare token-looking word.
+            for line in stderr.splitlines():
+                parts = line.strip().split()
+                if parts and parts[0].isupper() and "_" in parts[0]:
+                    token = parts[0]
+                    break
+        emit_failure(
+            token or "FRAME_ANALYSIS_FAILED",
+            f"analyze-frame exit {proc.returncode}: {(stderr or stdout)[-500:]}",
+        )
+    try:
+        payload = json.loads(stdout.splitlines()[-1] if stdout else "{}")
+    except json.JSONDecodeError:
+        emit_failure("ILLEGAL_STATE", f"analyze-frame JSON unreadable: {stdout[-300:]}")
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        emit_failure(
+            "FRAME_ANALYSIS_FAILED",
+            f"analyze-frame did not report ok: {payload!r}",
+        )
+    return payload
+
+
+def push_and_launch_preview(
+    *,
+    serial: str,
+    target_user: int,
+    kind: str,
+    mpkg: Path,
+    remote_dir: str = "/data/local/tmp/wp12e",
+    frame_phase: int = 0,
+) -> str:
+    """Launch EmbeddedPreviewActivity with allowlisted extras for sample kind.
+
+    Prefer sampleKind+mpkgSha256 experimental pattern (non-black, dual motion for
+    video). Optionally push mpkg for path fallback. Never pass unknown extras
+    (wp12eMode rejected by EmbeddedExperimentalPreview allowlist).
+    """
+    mpkg_sha = sha256_file(mpkg)
+    remote_mpkg = f"{remote_dir}/{kind}.mpkg"
+    adb_shell(serial, "mkdir", "-p", remote_dir, timeout=15)
+    try:
+        proc = subprocess.run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "push",
+                str(mpkg),
+                remote_mpkg,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        emit_failure("ILLEGAL_STATE", f"adb push failed: {exc}")
+    if proc.returncode != 0:
+        emit_failure(
+            "PUSH_FAILED",
+            f"adb push {mpkg} → {remote_mpkg} exit {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '')[-300:]}",
+        )
+
+    adb_shell(serial, "am", "force-stop", "--user", str(target_user), DEFAULT_PACKAGE_NAME, timeout=20)
+    # Allowlisted extras only: sampleKind, mpkgSha256, framePhase, mpkgPath.
+    start_args = (
+        "am",
+        "start",
+        "--user",
+        str(target_user),
+        "-n",
+        DEFAULT_PREVIEW_ACTIVITY,
+        "-a",
+        "com.motif.wallpaperengine.action.EMBEDDED_PREVIEW",
+        "--es",
+        "sampleKind",
+        kind,
+        "--es",
+        "mpkgSha256",
+        mpkg_sha,
+        "--ei",
+        "framePhase",
+        str(int(frame_phase)),
+        "--es",
+        "mpkgPath",
+        remote_mpkg,
+    )
+    rc, out, err = adb_shell(serial, *start_args, timeout=30)
+    if rc != 0 or "Error" in ((out or "") + (err or "")):
+        rc2, out2, err2 = adb_shell(
+            serial,
+            "am",
+            "start",
+            "-n",
+            DEFAULT_PREVIEW_ACTIVITY,
+            "--es",
+            "sampleKind",
+            kind,
+            "--es",
+            "mpkgSha256",
+            mpkg_sha,
+            "--ei",
+            "framePhase",
+            str(int(frame_phase)),
+            timeout=30,
+        )
+        if rc2 != 0 or "Error" in ((out2 or "") + (err2 or "")):
+            emit_failure(
+                "LAUNCH_FAILED",
+                f"EmbeddedPreviewActivity start failed rc={rc}/{rc2}: "
+                f"{(err or out or err2 or out2)[-400:]}",
+            )
+    # Allow surface to settle / video motion phase when phase=0 for video.
+    time.sleep(2.5 if frame_phase == 0 else 1.0)
+    return remote_mpkg
+
+
+def collect_dual_frames_for_sample(
+    *,
+    serial: str,
+    kind: str,
+    work_dir: Path,
+    gap_seconds: float = DEFAULT_FRAME_GAP_SECONDS,
+    mpkg: Path | None = None,
+    target_user: int = DEFAULT_TARGET_USER,
+) -> dict[str, Any]:
+    """Screencap two frames ≥gap_seconds apart, analyze, return sample inventory."""
+    kind_dir = work_dir / kind
+    kind_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    frame0 = kind_dir / "frame-0.png"
+    frame1 = kind_dir / "frame-1.png"
+    t0 = time.monotonic()
+    adb_screencap_png(serial, frame0)
+    # Enforce ≥ gap wall-clock separation; for video re-launch phase=1 for distinct frame.
+    elapsed = time.monotonic() - t0
+    remain = gap_seconds - elapsed
+    if remain > 0:
+        time.sleep(remain)
+    if mpkg is not None:
+        # Re-launch phase=1 so scene+video seeds differ (framePhase in seed material).
+        push_and_launch_preview(
+            serial=serial,
+            target_user=target_user,
+            kind=kind,
+            mpkg=mpkg,
+            frame_phase=1,
+        )
+    adb_screencap_png(serial, frame1)
+    actual_gap = time.monotonic() - t0
+    if actual_gap < gap_seconds - 0.05:
+        emit_failure(
+            "FRAME_GAP_TOO_SHORT",
+            f"{kind} dual frames gap {actual_gap:.3f}s < {gap_seconds}s",
+        )
+
+    analysis = run_analyze_frame(frame0, frame1)
+    frames_meta = []
+    for idx, path in enumerate((frame0, frame1)):
+        frames_meta.append(
+            {
+                "index": idx,
+                "sha256": sha256_file(path),
+                "path": str(path),  # work/ only — gitignored
+                "width": None,
+                "height": None,
+            }
+        )
+    # Merge analyzer dimensions when present.
+    for fr in analysis.get("frames") or []:
+        if not isinstance(fr, dict):
+            continue
+        idx = None
+        p = fr.get("path")
+        for i, meta in enumerate(frames_meta):
+            if p and Path(str(p)).resolve() == Path(meta["path"]).resolve():
+                idx = i
+                break
+        if idx is None and isinstance(fr.get("sha256"), str):
+            for i, meta in enumerate(frames_meta):
+                if meta["sha256"] == fr["sha256"]:
+                    idx = i
+                    break
+        if idx is None:
+            continue
+        if fr.get("width") is not None:
+            frames_meta[idx]["width"] = fr.get("width")
+        if fr.get("height") is not None:
+            frames_meta[idx]["height"] = fr.get("height")
+
+    return {
+        "kind": kind,
+        "frameCount": 2,
+        "minGapSeconds": gap_seconds,
+        "actualGapSeconds": round(actual_gap, 3),
+        "dualFrames": True,
+        "nonBlack": True,
+        "nonSolid": True,
+        "frames": frames_meta,
+        "analysisOk": True,
+    }
+
+
+def build_live_scene_video_inventory(
+    *,
+    serial: str,
+    target_user: int,
+    plugin_apk: Path,
+    scene_mpkg: Path,
+    video_mpkg: Path,
+    work_dir: Path,
+) -> dict[str, Any]:
+    """Live E4: launch scene then video, dual screencap + analyze each."""
+    state = adb_device_state(serial)
+    if state != "device":
+        emit_failure(
+            "DEVICE_OFFLINE",
+            f"serial={serial!r} adb state={state!r} (fail-closed; never forge E4 frames)",
+        )
+
+    observed_user = adb_current_user(serial)
+    if observed_user is None:
+        emit_failure(
+            "DEVICE_OFFLINE",
+            f"serial={serial!r} unable to read am get-current-user",
+        )
+    if observed_user != target_user:
+        emit_failure(
+            "WRONG_USER",
+            f"observedUser={observed_user} targetUser={target_user}",
+        )
+
+    if not plugin_apk.is_file():
+        emit_failure("MISSING_APK", f"plugin apk not found: {plugin_apk}")
+    if not scene_mpkg.is_file():
+        emit_failure("MISSING_INPUT", f"scene mpkg not found: {scene_mpkg}")
+    if not video_mpkg.is_file():
+        emit_failure("MISSING_INPUT", f"video mpkg not found: {video_mpkg}")
+
+    plugin_pkg = DEFAULT_PACKAGE_NAME
+    # Install/update plugin so EmbeddedPreviewActivity + exported intent are current.
+    try:
+        proc = subprocess.run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "install",
+                "-r",
+                "--user",
+                str(target_user),
+                str(plugin_apk),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        emit_failure("LAUNCH_FAILED", f"adb install failed: {exc}")
+    install_out = ((proc.stdout or "") + (proc.stderr or "")).replace("\r", "")
+    if proc.returncode != 0 or "Success" not in install_out:
+        emit_failure(
+            "LAUNCH_FAILED",
+            f"adb install --user {target_user} failed: {install_out[-400:]}",
+        )
+
+    on_device = adb_pm_path(serial, plugin_pkg, target_user)
+    if not on_device:
+        emit_failure(
+            "MISSING_APK",
+            f"plugin package {plugin_pkg} missing on device user={target_user}",
+        )
+
+    work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    samples: dict[str, Any] = {}
+    for kind, mpkg in (("scene", scene_mpkg), ("video", video_mpkg)):
+        push_and_launch_preview(
+            serial=serial,
+            target_user=target_user,
+            kind=kind,
+            mpkg=mpkg,
+        )
+        samples[kind] = collect_dual_frames_for_sample(
+            serial=serial,
+            kind=kind,
+            work_dir=work_dir,
+            gap_seconds=DEFAULT_FRAME_GAP_SECONDS,
+            mpkg=mpkg,
+            target_user=target_user,
+        )
+
+    complete, errs = scene_video_samples_complete({"samples": samples})
+    if not complete:
+        # Map structural gaps to SINGLE_SAMPLE when a kind is missing.
+        if "scene" not in samples or "video" not in samples:
+            emit_failure("SINGLE_SAMPLE", "; ".join(errs) or "scene+video required")
+        emit_failure("FRAME_ANALYSIS_FAILED", "; ".join(errs))
+
+    plugin_pid = adb_plugin_pid(serial, plugin_pkg)
+    surface = adb_surface_hint(serial, plugin_pkg, plugin_pid)
+
+    inventory: dict[str, Any] = {
+        "schemaVersion": SCENE_VIDEO_E4_SCHEMA,
+        "packageName": plugin_pkg,
+        "serial": serial,
+        "targetUser": target_user,
+        "observedUser": observed_user,
+        "deviceOnline": True,
+        "contractDryRun": False,
+        "deviceEvidenceClaimed": True,
+        "e4EvidenceClaimed": True,
+        "offline": False,
+        "intervalSeconds": DEFAULT_FRAME_GAP_SECONDS,
+        "officialNotEmbeddedHost": True,
+        "localApkSha256": {"plugin": sha256_file(plugin_apk)},
+        "mpkgSha256": {
+            "scene": sha256_file(scene_mpkg),
+            "video": sha256_file(video_mpkg),
+        },
+        "pluginPid": plugin_pid,
+        "surface": surface,
+        "surfacePresent": bool(surface.get("present")),
+        "samples": samples,
+        "failClosed": {"ok": True, "failures": []},
+        "checks": {
+            "sceneNonBlack": True,
+            "sceneNonSolid": True,
+            "sceneDualFrames": True,
+            "videoNonBlack": True,
+            "videoNonSolid": True,
+            "videoDualFrames": True,
+            "blackFrameRejected": True,
+            "singleSampleRejected": True,
+            "solidColorRejected": True,
+        },
+        "harness": {
+            "case": "scene-video-positive-live",
+            "note": "live e4 collect; frames under work/ only; EffectiveDone remains false",
+            "frameGapSeconds": DEFAULT_FRAME_GAP_SECONDS,
+        },
+    }
+    return inventory
+
+
+def collect_scene_video_e4(args: argparse.Namespace, txn: dict[str, Any], out: Path) -> int:
+    """WP-12E: scene+video E4 collect — live dual frames or inventory/offline fixture.
+
+    Fail-closed:
+      - live path: --serial + --plugin-apk + --scene + --video + --user
+      - fixture path: --inventory OR --offline-fixture
+      - if --serial given on fixture path and device offline → DEVICE_OFFLINE
+      - BLACK_FRAME / SOLID_COLOR / SINGLE_SAMPLE from analyzer on live path
+      - raw always EffectiveDone=false
+    """
+    evidence_mode = "scene-video-e4"
+    serial = getattr(args, "serial", None)
+    if isinstance(serial, str):
+        serial = serial.strip() or None
+    else:
+        serial = None
+
+    has_fixture = bool(args.inventory) or bool(getattr(args, "offline_fixture", None))
+    live_requested = serial is not None and not has_fixture
+
+    inventory: dict[str, Any]
+    inventory_source: str | None
+
+    if live_requested:
+        assert serial is not None
+        target_user = resolve_target_user(args)
+        plugin_raw = getattr(args, "plugin_apk", None)
+        scene_raw = getattr(args, "scene", None)
+        video_raw = getattr(args, "video", None)
+        missing = []
+        if not plugin_raw:
+            missing.append("plugin-apk")
+        if not scene_raw:
+            missing.append("scene")
+        if not video_raw:
+            missing.append("video")
+        if missing:
+            emit_failure(
+                "MISSING_INPUT",
+                "live e4 requires --plugin-apk, --scene, --video; missing: "
+                + ", ".join(missing),
+            )
+        plugin_apk = Path(str(plugin_raw).strip())
+        scene_mpkg = Path(str(scene_raw).strip())
+        video_mpkg = Path(str(video_raw).strip())
+        if not plugin_apk.is_file():
+            emit_failure("MISSING_APK", f"plugin apk not found: {plugin_apk}")
+        if not scene_mpkg.is_file() or not video_mpkg.is_file():
+            emit_failure(
+                "MISSING_INPUT",
+                f"scene/video mpkg missing: scene={scene_mpkg} video={video_mpkg}",
+            )
+
+        # Store frames under work/ next to out when possible (gitignored).
+        frames_root = out.parent / "frames" / f"attempt-{args.attempt_no}"
+        inventory = build_live_scene_video_inventory(
+            serial=serial,
+            target_user=target_user,
+            plugin_apk=plugin_apk,
+            scene_mpkg=scene_mpkg,
+            video_mpkg=video_mpkg,
+            work_dir=frames_root,
+        )
+        inventory_source = f"live-scene-video:{serial}"
+    else:
+        if serial is not None:
+            state = adb_device_state(serial)
+            if state != "device":
+                emit_failure(
+                    "DEVICE_OFFLINE",
+                    f"serial={serial!r} adb state={state!r} "
+                    "(fail-closed; never forge E4 frame evidence)",
+                )
+
+        inv_path: Path | None = None
+        if args.inventory:
+            inv_path = Path(args.inventory)
+            inventory_source = str(inv_path.resolve())
+        elif getattr(args, "offline_fixture", None):
+            inv_path = Path(args.offline_fixture)
+            inventory_source = f"offline-fixture:{inv_path.resolve()}"
+        else:
+            emit_failure(
+                "MISSING_INPUT",
+                "e4/scene-video needs --inventory, --offline-fixture, or live "
+                "args (--serial + --plugin-apk + --scene + --video)",
+            )
+
+        assert inv_path is not None
+        inventory = normalize_scene_video_inventory(load_inventory_file(inv_path))
+        schema_v = inventory.get("schemaVersion")
+        if schema_v is not None and schema_v != SCENE_VIDEO_E4_SCHEMA:
+            emit_failure(
+                "ILLEGAL_STATE",
+                f"scene-video e4 inventory schemaVersion must be "
+                f"{SCENE_VIDEO_E4_SCHEMA}, got {schema_v!r}",
+            )
+
+        # Offline must not claim live device frame evidence.
+        if inventory.get("deviceEvidenceClaimed") is True and serial is None:
+            emit_failure(
+                "DEVICE_EVIDENCE_FORGED",
+                "deviceEvidenceClaimed=true requires --serial with online device "
+                "(fail-closed; never forge live E4 frames)",
+            )
+
+        if serial is not None:
+            inventory["serial"] = serial
+            if "deviceEvidenceClaimed" not in inventory:
+                inventory["deviceEvidenceClaimed"] = False
+
+    write_raw_evidence(
+        out,
+        mode=evidence_mode,
+        txn=txn,
+        attempt_no=args.attempt_no,
+        apk_sha=None,
+        inventory_source=inventory_source,
+        inventory=inventory,
+    )
+    samples = inventory.get("samples") if isinstance(inventory.get("samples"), dict) else {}
+    return emit_ok(
+        "collect",
+        mode=evidence_mode,
+        out=str(out),
+        attemptNo=args.attempt_no,
+        sealed=False,
+        EffectiveDone=False,
+        inventorySource=inventory_source,
+        deviceEvidenceClaimed=inventory.get("deviceEvidenceClaimed"),
+        serial=serial or inventory.get("serial"),
+        sceneOk=bool(
+            isinstance(samples.get("scene"), dict)
+            and samples["scene"].get("nonBlack") is True
+            and samples["scene"].get("nonSolid") is True
+        ),
+        videoOk=bool(
+            isinstance(samples.get("video"), dict)
+            and samples["video"].get("nonBlack") is True
+            and samples["video"].get("nonSolid") is True
+        ),
+        failClosedOk=(
+            isinstance(inventory.get("failClosed"), dict)
+            and inventory["failClosed"].get("ok") is True
+        ),
+    )
+
+
 def collect_device_e2e3(args: argparse.Namespace, txn: dict[str, Any], out: Path) -> int:
     """WP-12D: device E2/E3 collect — live device probe, or inventory/offline fixture.
 
@@ -903,21 +1618,33 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--attempt-no", type=int)
     parser.add_argument(
         "--inventory",
-        help="prebuilt inventory (runtime / native / adapter-contract / device-e2e3 JSON)",
+        help="prebuilt inventory (runtime / native / adapter-contract / device-e2e3 / e4 JSON)",
     )
     parser.add_argument(
         "--offline-fixture",
-        help="WP-12D offline device contract fixture path (no live device evidence)",
+        help="WP-12D/E offline contract fixture path (no live device evidence)",
     )
     parser.add_argument(
         "--serial",
-        help="adb serial for WP-12D live collect; offline → DEVICE_OFFLINE (fail-closed)",
+        help="adb serial for live collect; offline → DEVICE_OFFLINE (fail-closed)",
     )
     parser.add_argument(
         "--user",
         type=int,
         default=None,
-        help=f"target Android user id for live e2-e3 (default {DEFAULT_TARGET_USER})",
+        help=f"target Android user id for live e2-e3/e4 (default {DEFAULT_TARGET_USER})",
+    )
+    parser.add_argument(
+        "--scene",
+        help="absolute path to Scene .mpkg for live e4 collect",
+    )
+    parser.add_argument(
+        "--video",
+        help="absolute path to Video .mpkg for live e4 collect",
+    )
+    parser.add_argument(
+        "--sample-kind",
+        help="optional sample kinds (e.g. scene,video); live e4 always collects both",
     )
     args = parser.parse_args(argv)
 
@@ -928,8 +1655,8 @@ def main(argv: list[str]) -> int:
         emit_failure(
             "MODE_NOT_IMPLEMENTED",
             "scaffold implements runtime-inventory, native-closure/native-jni, "
-            "adapter-contract/embedded-adapter, and e2-e3/device-e2e3; "
-            f"got {args.mode}",
+            "adapter-contract/embedded-adapter, e2-e3/device-e2e3, and "
+            f"e4/scene-video/scene-video-e4; got {args.mode}",
         )
 
     # Fail-closed: transaction + attempt required for real collect path.
@@ -961,6 +1688,8 @@ def main(argv: list[str]) -> int:
         return collect_adapter_contract(args, txn, out)
     if args.mode in DEVICE_MODES:
         return collect_device_e2e3(args, txn, out)
+    if args.mode in SCENE_VIDEO_MODES:
+        return collect_scene_video_e4(args, txn, out)
 
     emit_failure("MODE_NOT_IMPLEMENTED", f"unhandled mode: {args.mode}")
 

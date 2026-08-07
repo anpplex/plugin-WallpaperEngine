@@ -2448,5 +2448,401 @@ class TestNativeClosureSeal(unittest.TestCase):
             self.assertFalse(payload.get("EffectiveDone"))
 
 
+class TestWp12ePhaseAndCollect(unittest.TestCase):
+    """WP-12E experimental: phase fences + scene/video e4 collect/seal.
+
+    RED harness (scripts/verify-embedded-scene-video.sh) may land in a
+    parallel PR; when missing, RED signature tests skip with a clear message.
+    Fail-closed: never forges EffectiveDone; inventorySealed only for dual
+    nonBlack nonSolid scene+video samples.
+    """
+
+    VERIFY_SCENE_VIDEO = PLUGIN_ROOT / "scripts" / "verify-embedded-scene-video.sh"
+    PASS_FIXTURE = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "frame-e4-pass-offline.json"
+    )
+    NEG_FIXTURE = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "frame-black.json"
+    )
+    SINGLE_SAMPLE_FIXTURE = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "frame-single-sample.json"
+    )
+    ACCEPTABLE_RED_SIGS = frozenset({"BLACK_FRAME", "SINGLE_SAMPLE", "SOLID_COLOR"})
+
+    def _init_local_wp12e(self, tmp: str) -> Path:
+        proc = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12E",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertEqual(parse_json_stdout(proc).get("state"), "TREE_FROZEN")
+        txn = Path(tmp) / "wp-12e.json"
+        self.assertTrue(txn.is_file(), f"expected transaction file {txn}")
+        return txn
+
+    def test_wp12e_init_writes_wp12e_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn = self._init_local_wp12e(tmp)
+            receipt = json.loads(txn.read_text(encoding="utf-8"))
+            self.assertEqual(receipt.get("taskId"), "WP-12E")
+            self.assertEqual(receipt.get("state"), "TREE_FROZEN")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+    def test_wp12e_record_red_when_harness_present(self) -> None:
+        """record-phase RED for WP-12E → RED_RECORDED with BLACK_FRAME|SINGLE_SAMPLE|SOLID_COLOR.
+
+        Skips when scripts/verify-embedded-scene-video.sh is not landed yet.
+        """
+        if not self.VERIFY_SCENE_VIDEO.is_file():
+            self.skipTest(
+                "WP-12E RED harness missing: scripts/verify-embedded-scene-video.sh "
+                "(land frame harness before RED signature pin; primary tokens "
+                "BLACK_FRAME, SINGLE_SAMPLE, or SOLID_COLOR)"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local_wp12e(tmp)
+            red = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12E",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(red.returncode, 0, msg=red.stdout + red.stderr)
+            payload = parse_json_stdout(red)
+            self.assertEqual(payload.get("state"), "RED_RECORDED")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12e.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "RED_RECORDED")
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 1)
+            event = receipt["phaseEvents"][0]
+            self.assertEqual(event["phase"], "RED")
+            self.assertNotEqual(event["exitCode"], 0)
+            self.assertIn(event["failureSignature"], self.ACCEPTABLE_RED_SIGS)
+            self.assertEqual(event["stateAfter"], "RED_RECORDED")
+            self.assertIn("stderrSha256", event)
+            self.assertIn("argv", event)
+            argv = event["argv"]
+            self.assertIn("scripts/verify-embedded-scene-video.sh", argv)
+            self.assertIn("frame-negative", argv)
+
+    def test_wp12e_collect_e4_from_offline_fixture(self) -> None:
+        """e4 collect from --offline-fixture writes raw EffectiveDone=false."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--offline-fixture",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            collect_payload = parse_json_stdout(collect)
+            self.assertEqual(collect_payload.get("mode"), "scene-video-e4")
+            self.assertFalse(collect_payload.get("EffectiveDone"))
+            self.assertFalse(collect_payload.get("sealed"))
+            self.assertTrue(collect_payload.get("sceneOk"))
+            self.assertTrue(collect_payload.get("videoOk"))
+
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertEqual(raw.get("mode"), "scene-video-e4")
+            self.assertFalse(raw.get("EffectiveDone"))
+            self.assertFalse(raw.get("sealed"))
+            inv = raw["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12e-scene-video-e4/v1")
+            self.assertEqual(
+                inv.get("packageName") or "com.motif.wallpaperengine",
+                "com.motif.wallpaperengine",
+            )
+            self.assertTrue(inv.get("failClosed", {}).get("ok"))
+            samples = inv.get("samples") or {}
+            self.assertIn("scene", samples)
+            self.assertIn("video", samples)
+            self.assertTrue(samples["scene"].get("nonBlack"))
+            self.assertTrue(samples["scene"].get("nonSolid"))
+            self.assertTrue(samples["video"].get("nonBlack"))
+            self.assertTrue(samples["video"].get("nonSolid"))
+            # Must not require WP-12A/B/C/D keys.
+            for key in (
+                "manifest",
+                "dex",
+                "resources",
+                "authorities",
+                "permissions",
+                "abis",
+                "embeddedRuntimeDefault",
+            ):
+                self.assertNotIn(key, inv)
+
+    def test_wp12e_collect_scene_video_alias_from_inventory(self) -> None:
+        """scene-video alias + --inventory path also works."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "scene-video",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("mode"), "scene-video-e4")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+    def test_wp12e_collect_missing_inventory_and_fixture_fails(self) -> None:
+        """Without --inventory/--offline-fixture/live args → MISSING_INPUT."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "MISSING_INPUT")
+            self.assertFalse(raw_out.exists())
+
+    def test_wp12e_collect_live_missing_inputs_fails(self) -> None:
+        """Live path with --serial but missing plugin/scene/video → MISSING_INPUT."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--serial",
+                "OFFLINE-SERIAL-DOES-NOT-EXIST-wp12e",
+                "--user",
+                "12",
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "MISSING_INPUT")
+            self.assertFalse(raw_out.exists())
+
+    def test_wp12e_collect_live_offline_serial_device_offline(self) -> None:
+        """Live path: inputs present + offline serial → DEVICE_OFFLINE (never forge)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            plugin = Path(tmp) / "plugin.apk"
+            scene = Path(tmp) / "scene.mpkg"
+            video = Path(tmp) / "video.mpkg"
+            plugin.write_bytes(b"wp12e-fake-apk\n")
+            scene.write_bytes(b"wp12e-fake-scene\n")
+            video.write_bytes(b"wp12e-fake-video\n")
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--serial",
+                "OFFLINE-SERIAL-DOES-NOT-EXIST-wp12e",
+                "--user",
+                "12",
+                "--plugin-apk",
+                str(plugin),
+                "--scene",
+                str(scene),
+                "--video",
+                str(video),
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "DEVICE_OFFLINE")
+            self.assertFalse(raw_out.exists())
+
+    def test_wp12e_seal_offline_fixture_inventory_sealed_effective_done_false(self) -> None:
+        """offline e4 fixture → inventorySealed=true; EffectiveDone always false."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--offline-fixture",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_payload = parse_json_stdout(seal)
+            self.assertTrue(seal_payload.get("inventorySealed"))
+            self.assertFalse(seal_payload.get("EffectiveDone"))
+            self.assertTrue(seal_payload.get("sceneVideo"))
+            self.assertFalse(seal_payload.get("device"))
+            self.assertFalse(seal_payload.get("adapter"))
+            self.assertFalse(seal_payload.get("native"))
+
+            sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+            self.assertTrue(sealed.get("inventorySealed"))
+            self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertEqual(sealed.get("mode"), "scene-video-e4")
+            self.assertEqual(sealed.get("taskId"), "WP-12E")
+            self.assertEqual(
+                sealed.get("inventorySchemaVersion"), "wp12e-scene-video-e4/v1"
+            )
+            inv = sealed["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12e-scene-video-e4/v1")
+            samples = inv.get("samples") or {}
+            self.assertTrue(samples["scene"].get("nonBlack"))
+            self.assertTrue(samples["scene"].get("nonSolid"))
+            self.assertTrue(samples["video"].get("nonBlack"))
+            self.assertTrue(samples["video"].get("nonSolid"))
+            # Offline harness: ≥1 hashed frame per sample + intervalSeconds≥3.
+            # Live path: ≥2 frames per sample. Both acceptable for inventorySealed.
+            self.assertGreaterEqual(len(samples["scene"].get("frames") or []), 1)
+            self.assertGreaterEqual(len(samples["video"].get("frames") or []), 1)
+            # Frame paths must not leak into sealed inventory (work/ only).
+            for kind in ("scene", "video"):
+                for fr in samples[kind].get("frames") or []:
+                    self.assertNotIn("path", fr)
+            self.assertNotIn("manifest", inv)
+            self.assertNotIn("abis", inv)
+            self.assertTrue(sealed.get("failClosed", {}).get("ok"))
+            # Frame hashes promoted into sealed.hashes
+            hashes = sealed.get("hashes") or {}
+            self.assertTrue(
+                any(k.startswith("sceneFrame") and k.endswith("Sha256") for k in hashes),
+                msg=f"expected scene frame hash in {hashes.keys()}",
+            )
+            self.assertTrue(
+                any(k.startswith("videoFrame") and k.endswith("Sha256") for k in hashes),
+                msg=f"expected video frame hash in {hashes.keys()}",
+            )
+
+    def test_wp12e_seal_fail_closed_rejected(self) -> None:
+        """failClosed.ok=false → FAIL_CLOSED_NOT_OK; no inventorySealed claim."""
+        self.assertTrue(self.NEG_FIXTURE.is_file(), f"missing fixture {self.NEG_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.NEG_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertNotEqual(seal.returncode, 0)
+            payload = parse_json_stdout(seal)
+            self.assertEqual(payload.get("failureReason"), "FAIL_CLOSED_NOT_OK")
+            self.assertFalse(sealed_out.exists())
+
+    def test_wp12e_seal_single_sample_not_inventory_sealed(self) -> None:
+        """SINGLE_SAMPLE fixture (video missing) fails seal shape / completeness."""
+        self.assertTrue(
+            self.SINGLE_SAMPLE_FIXTURE.is_file(),
+            f"missing fixture {self.SINGLE_SAMPLE_FIXTURE}",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12e(tmp)
+            # Build a raw with failClosed.ok forced true but video missing → shape fail
+            inv = json.loads(self.SINGLE_SAMPLE_FIXTURE.read_text(encoding="utf-8"))
+            inv["failClosed"] = {"ok": True, "failures": []}
+            inv_path = Path(tmp) / "single.json"
+            inv_path.write_text(json.dumps(inv, indent=2) + "\n", encoding="utf-8")
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e4",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(inv_path),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            # Missing video sample → INVENTORY_SHAPE_INVALID (or not sealed).
+            if seal.returncode == 0:
+                sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+                self.assertFalse(sealed.get("inventorySealed"))
+                self.assertFalse(sealed.get("EffectiveDone"))
+            else:
+                payload = parse_json_stdout(seal)
+                self.assertIn(
+                    payload.get("failureReason"),
+                    {"INVENTORY_SHAPE_INVALID", "INVENTORY_INCOMPLETE"},
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

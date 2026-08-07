@@ -25,6 +25,10 @@ Supports:
     inventorySealed when checks complete and deviceEvidenceClaimed is explicit
     (bool). EffectiveDone stays false always from sealer; never forges device
     evidence or task DONE.
+  - WP-12E scene-video e4 (schemaVersion wp12e-scene-video-e4/v1):
+    inventorySealed when both scene and video samples are dual-frame,
+    nonBlack, and nonSolid with distinct frame hashes. EffectiveDone always
+    false from sealer (never forged).
 """
 
 from __future__ import annotations
@@ -66,14 +70,24 @@ REQUIRED_DEVICE_INVENTORY = (
     "failClosed",
     "checks",
 )
+# Minimum keys for scene-video e4 inventories (WP-12E).
+# packageName is optional on harness offline fixtures (defaulted at seal).
+REQUIRED_SCENE_VIDEO_INVENTORY = (
+    "schemaVersion",
+    "failClosed",
+    "samples",
+)
 NATIVE_SCHEMA_PREFIX = "wp12b-native"
 ADAPTER_SCHEMA_VERSION = "wp12c-adapter-contract/v1"
 ADAPTER_SCHEMA_PREFIX = "wp12c-adapter-contract"
 DEVICE_SCHEMA_VERSION = "wp12d-device-e2e3/v1"
 DEVICE_SCHEMA_PREFIX = "wp12d-device-e2e3"
+SCENE_VIDEO_SCHEMA_VERSION = "wp12e-scene-video-e4/v1"
+SCENE_VIDEO_SCHEMA_PREFIX = "wp12e-scene-video-e4"
 NATIVE_MODES = frozenset({"native-closure", "native-jni"})
 ADAPTER_MODES = frozenset({"adapter-contract", "embedded-adapter"})
 DEVICE_MODES = frozenset({"device-e2e3", "e2-e3"})
+SCENE_VIDEO_MODES = frozenset({"e4", "scene-video", "scene-video-e4"})
 REQUIRED_ADAPTER_CHECKS = (
     "unknownMethodRejected",
     "appendedArgsRejected",
@@ -85,6 +99,14 @@ REQUIRED_DEVICE_CHECKS = (
     "wrongUserRejected",
     "officialAsEmbeddedHostRejected",
     "offlineFailClosed",
+)
+REQUIRED_SCENE_VIDEO_CHECKS = (
+    "sceneNonBlack",
+    "sceneNonSolid",
+    "sceneDualFrames",
+    "videoNonBlack",
+    "videoNonSolid",
+    "videoDualFrames",
 )
 # Official WE client class used by WP-12 inventory runs.
 OFFICIAL_APK_SHA256 = "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0"
@@ -143,6 +165,14 @@ def is_device_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
         return True
     schema_v = inventory.get("schemaVersion")
     return isinstance(schema_v, str) and schema_v.startswith(DEVICE_SCHEMA_PREFIX)
+
+
+def is_scene_video_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
+    """Detect WP-12E scene-video e4 from raw.mode or inventory.schemaVersion."""
+    if isinstance(mode, str) and mode in SCENE_VIDEO_MODES:
+        return True
+    schema_v = inventory.get("schemaVersion")
+    return isinstance(schema_v, str) and schema_v.startswith(SCENE_VIDEO_SCHEMA_PREFIX)
 
 
 def arm64_lib_count(inventory: dict[str, Any]) -> int:
@@ -483,6 +513,212 @@ def validate_device_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _frame_sha_ok(fr: Any) -> bool:
+    if not isinstance(fr, dict):
+        return False
+    sha = fr.get("sha256")
+    return (
+        isinstance(sha, str)
+        and len(sha) == 64
+        and all(c in "0123456789abcdef" for c in sha.lower())
+    )
+
+
+def _sample_nonblack_nonsolid_frames(sample: Any, *, kind: str) -> list[str]:
+    """Return errors if sample lacks nonBlack/nonSolid with ≥1 hashed frame."""
+    errors: list[str] = []
+    if not isinstance(sample, dict):
+        return [f"{kind} sample must be object"]
+    if sample.get("nonBlack") is not True:
+        errors.append(f"{kind}.nonBlack must be true")
+    if sample.get("nonSolid") is not True:
+        errors.append(f"{kind}.nonSolid must be true")
+    frames = sample.get("frames")
+    if not isinstance(frames, list) or len(frames) < 1:
+        errors.append(f"{kind}.frames must be non-empty array")
+        return errors
+    valid = 0
+    hashes: list[str] = []
+    for i, fr in enumerate(frames):
+        if not isinstance(fr, dict):
+            errors.append(f"{kind}.frames[{i}] must be object")
+            continue
+        if not _frame_sha_ok(fr):
+            # path-only frames not accepted for seal (hashes only).
+            if not (isinstance(fr.get("path"), str) and fr.get("path")):
+                errors.append(f"{kind}.frames[{i}].sha256 must be 64-char hex")
+            continue
+        valid += 1
+        hashes.append(str(fr.get("sha256")).lower())
+    if valid < 1:
+        errors.append(f"{kind} needs ≥1 frame with sha256")
+    # When dual frames present, hashes must differ (live dual screencap).
+    if len(hashes) >= 2 and hashes[0] == hashes[1]:
+        errors.append(f"{kind} dual frame hashes must differ")
+    return errors
+
+
+def _interval_ok(inventory: dict[str, Any]) -> bool:
+    """True when dual-frame gap is evidenced (≥3s).
+
+    Accepts:
+      - intervalSeconds ≥ 3 (offline harness dual-sample contract)
+      - per-sample dualFrames / frameCount≥2 / frames≥2 (live dual screencap)
+      - dual capturedAt timestamps spanning ≥3s across scene+video frames
+    """
+    interval = inventory.get("intervalSeconds")
+    if isinstance(interval, (int, float)) and not isinstance(interval, bool):
+        if float(interval) >= 3.0:
+            return True
+
+    samples = inventory.get("samples")
+    if not isinstance(samples, dict):
+        return False
+
+    # Per-sample dual frames count as dual for that kind.
+    dual_kinds = 0
+    timestamps: list[str] = []
+    for kind in ("scene", "video"):
+        sample = samples.get(kind)
+        if not isinstance(sample, dict):
+            continue
+        frames = sample.get("frames") if isinstance(sample.get("frames"), list) else []
+        if (
+            sample.get("dualFrames") is True
+            or (isinstance(sample.get("frameCount"), int) and sample["frameCount"] >= 2)
+            or len(frames) >= 2
+        ):
+            dual_kinds += 1
+        for fr in frames:
+            if isinstance(fr, dict) and isinstance(fr.get("capturedAt"), str):
+                timestamps.append(fr["capturedAt"])
+
+    if dual_kinds >= 2:
+        return True
+    # Both samples present with ≥1 frame each + intervalSeconds already checked.
+    # Offline harness: one frame each + intervalSeconds≥3 is dual-sample E4.
+    scene = samples.get("scene") if isinstance(samples.get("scene"), dict) else None
+    video = samples.get("video") if isinstance(samples.get("video"), dict) else None
+    if scene and video:
+        sf = scene.get("frames") if isinstance(scene.get("frames"), list) else []
+        vf = video.get("frames") if isinstance(video.get("frames"), list) else []
+        if len(sf) >= 1 and len(vf) >= 1:
+            # Prefer explicit interval; if missing, accept dual capturedAt gap.
+            if isinstance(interval, (int, float)) and not isinstance(interval, bool):
+                return float(interval) >= 3.0
+            if len(timestamps) >= 2:
+                try:
+                    from datetime import datetime
+
+                    def _parse(ts: str) -> datetime:
+                        t = ts.replace("Z", "+00:00")
+                        return datetime.fromisoformat(t)
+
+                    times = sorted(_parse(t) for t in timestamps)
+                    gap = (times[-1] - times[0]).total_seconds()
+                    return gap >= 3.0
+                except (TypeError, ValueError):
+                    pass
+            # Live path always sets dualFrames on each sample; offline harness
+            # sets intervalSeconds. If neither, fail closed.
+    return False
+
+
+def scene_video_samples_complete(inventory: dict[str, Any]) -> tuple[bool, list[str]]:
+    """inventorySealed core: both scene+video nonBlack nonSolid with frame evidence.
+
+    Dual-frame rule: each sample may carry ≥2 frames, or the inventory may
+    evidence ≥3s interval across the scene+video pair (offline harness).
+    """
+    errors: list[str] = []
+    samples = inventory.get("samples")
+    if not isinstance(samples, dict):
+        return False, ["samples must be object"]
+    for kind in ("scene", "video"):
+        if kind not in samples:
+            errors.append(f"samples.{kind} missing")
+            continue
+        errors.extend(_sample_nonblack_nonsolid_frames(samples.get(kind), kind=kind))
+    if not _interval_ok(inventory):
+        errors.append(
+            "dual-frame interval required (intervalSeconds≥3 or ≥2 frames/sample)"
+        )
+    return (len(errors) == 0, errors)
+
+
+def scene_video_checks_complete(inventory: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Prefer explicit checks; otherwise derive from samples."""
+    errors: list[str] = []
+    checks = inventory.get("checks")
+    if isinstance(checks, dict) and checks:
+        for key in REQUIRED_SCENE_VIDEO_CHECKS:
+            if key not in checks:
+                errors.append(f"checks.{key} missing")
+            elif checks.get(key) is not True:
+                errors.append(f"checks.{key} must be true")
+        return (len(errors) == 0, errors)
+    return scene_video_samples_complete(inventory)
+
+
+def resolve_scene_video_package_name(inventory: dict[str, Any]) -> str | None:
+    package_name = inventory.get("packageName")
+    if isinstance(package_name, str) and package_name.strip():
+        return package_name.strip()
+    return None
+
+
+def validate_scene_video_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
+    """Return shape errors for WP-12E scene-video e4 inventory fields."""
+    errors: list[str] = []
+
+    schema_v = inventory.get("schemaVersion")
+    if not isinstance(schema_v, str) or not schema_v.startswith(SCENE_VIDEO_SCHEMA_PREFIX):
+        errors.append(
+            f"schemaVersion must start with {SCENE_VIDEO_SCHEMA_PREFIX!r}, got {schema_v!r}"
+        )
+    elif schema_v != SCENE_VIDEO_SCHEMA_VERSION:
+        errors.append(
+            f"schemaVersion must be {SCENE_VIDEO_SCHEMA_VERSION!r}, got {schema_v!r}"
+        )
+
+    # packageName optional on harness offline fixtures; default applied at seal.
+    package_name = inventory.get("packageName")
+    if package_name is not None and (
+        not isinstance(package_name, str) or not package_name.strip()
+    ):
+        errors.append("packageName must be non-empty string when present")
+
+    fail_closed = inventory.get("failClosed")
+    if not isinstance(fail_closed, dict):
+        errors.append("failClosed must be object")
+
+    samples = inventory.get("samples")
+    if not isinstance(samples, dict):
+        errors.append("samples must be object")
+    else:
+        for kind in ("scene", "video"):
+            if kind not in samples:
+                errors.append(f"samples.{kind} missing")
+
+    # Shape validation records sample field issues but seal completeness is separate.
+    if isinstance(samples, dict):
+        for kind in ("scene", "video"):
+            sample = samples.get(kind)
+            if sample is None:
+                continue
+            if not isinstance(sample, dict):
+                errors.append(f"samples.{kind} must be object")
+                continue
+            for flag in ("nonBlack", "nonSolid"):
+                if flag in sample and not isinstance(sample.get(flag), bool):
+                    errors.append(f"samples.{kind}.{flag} must be bool")
+            frames = sample.get("frames")
+            if frames is not None and not isinstance(frames, list):
+                errors.append(f"samples.{kind}.frames must be array when present")
+
+    return errors
+
+
 def inventory_is_complete(
     inventory: dict[str, Any],
     *,
@@ -490,6 +726,7 @@ def inventory_is_complete(
     native: bool,
     adapter: bool,
     device: bool = False,
+    scene_video: bool = False,
     require_official_sha: bool,
     expected_official_sha: str,
     apk_sha: str | None,
@@ -497,6 +734,18 @@ def inventory_is_complete(
     """inventorySealed criteria. EffectiveDone is never derived here."""
     if is_stub:
         return False
+    if scene_video:
+        if validate_scene_video_inventory_shapes(inventory):
+            return False
+        if not fail_closed_is_ok(inventory.get("failClosed")):
+            return False
+        samples_ok, _ = scene_video_samples_complete(inventory)
+        if not samples_ok:
+            return False
+        checks_ok, _ = scene_video_checks_complete(inventory)
+        if not checks_ok:
+            return False
+        return True
     if device:
         if validate_device_inventory_shapes(inventory):
             return False
@@ -547,8 +796,114 @@ def slice_inventory_for_seal(
     native: bool,
     adapter: bool,
     device: bool = False,
+    scene_video: bool = False,
 ) -> dict[str, Any]:
     """Preserve inventory shapes for sealed blob (no APK/SO bytes)."""
+    if scene_video:
+        samples_in = inventory.get("samples") if isinstance(inventory.get("samples"), dict) else {}
+        samples_out: dict[str, Any] = {}
+        for kind in ("scene", "video"):
+            sample = samples_in.get(kind)
+            if not isinstance(sample, dict):
+                continue
+            frames_out: list[dict[str, Any]] = []
+            for i, fr in enumerate(sample.get("frames") or []):
+                if not isinstance(fr, dict):
+                    continue
+                # Hashes only — never embed frame bytes / work paths into seal.
+                idx = fr.get("index")
+                if not isinstance(idx, int) or isinstance(idx, bool):
+                    idx = i
+                entry: dict[str, Any] = {
+                    "index": idx,
+                    "sha256": fr.get("sha256"),
+                }
+                if fr.get("capturedAt") is not None:
+                    entry["capturedAt"] = fr.get("capturedAt")
+                if fr.get("width") is not None:
+                    entry["width"] = fr.get("width")
+                if fr.get("height") is not None:
+                    entry["height"] = fr.get("height")
+                frames_out.append(entry)
+            samples_out[kind] = {
+                "kind": sample.get("kind") or kind,
+                "frameCount": sample.get("frameCount")
+                if sample.get("frameCount") is not None
+                else len(frames_out),
+                "minGapSeconds": sample.get("minGapSeconds"),
+                "dualFrames": sample.get("dualFrames")
+                if isinstance(sample.get("dualFrames"), bool)
+                else len(frames_out) >= 2,
+                "nonBlack": sample.get("nonBlack") is True,
+                "nonSolid": sample.get("nonSolid") is True,
+                "frames": frames_out,
+            }
+            if sample.get("actualGapSeconds") is not None:
+                samples_out[kind]["actualGapSeconds"] = sample.get("actualGapSeconds")
+
+        checks_in = inventory.get("checks") if isinstance(inventory.get("checks"), dict) else {}
+        if checks_in:
+            checks_out = {
+                key: bool(checks_in.get(key) is True) for key in REQUIRED_SCENE_VIDEO_CHECKS
+            }
+            for extra in (
+                "blackFrameRejected",
+                "singleSampleRejected",
+                "solidColorRejected",
+            ):
+                if extra in checks_in:
+                    checks_out[extra] = bool(checks_in.get(extra) is True)
+        else:
+            checks_out = {key: True for key in REQUIRED_SCENE_VIDEO_CHECKS}
+
+        package_name = resolve_scene_video_package_name(inventory) or (
+            inventory.get("packageName")
+            if isinstance(inventory.get("packageName"), str)
+            else "com.motif.wallpaperengine"
+        )
+        sliced_sv: dict[str, Any] = {
+            "schemaVersion": inventory.get("schemaVersion"),
+            "packageName": package_name,
+            "failClosed": inventory.get("failClosed")
+            if isinstance(inventory.get("failClosed"), dict)
+            else {"ok": False, "failures": []},
+            "samples": samples_out,
+            "checks": checks_out,
+        }
+        claimed = inventory.get("deviceEvidenceClaimed")
+        if not isinstance(claimed, bool) and "deviceE4Claim" in inventory:
+            claimed = inventory.get("deviceE4Claim")
+        if isinstance(claimed, bool):
+            sliced_sv["deviceEvidenceClaimed"] = claimed
+            sliced_sv["deviceE4Claim"] = claimed
+        if isinstance(inventory.get("offline"), bool):
+            sliced_sv["offline"] = inventory.get("offline")
+        if isinstance(inventory.get("contractDryRun"), bool):
+            sliced_sv["contractDryRun"] = inventory.get("contractDryRun")
+        if isinstance(inventory.get("deviceOnline"), bool):
+            sliced_sv["deviceOnline"] = inventory.get("deviceOnline")
+        if isinstance(inventory.get("intervalSeconds"), (int, float)) and not isinstance(
+            inventory.get("intervalSeconds"), bool
+        ):
+            sliced_sv["intervalSeconds"] = inventory.get("intervalSeconds")
+        if inventory.get("serial") is not None:
+            sliced_sv["serial"] = inventory.get("serial")
+        if isinstance(inventory.get("harness"), dict):
+            sliced_sv["harness"] = dict(inventory.get("harness") or {})
+        if isinstance(inventory.get("mpkgSha256"), dict):
+            sliced_sv["mpkgSha256"] = dict(inventory.get("mpkgSha256") or {})
+        if isinstance(inventory.get("localApkSha256"), dict):
+            sliced_sv["localApkSha256"] = dict(inventory.get("localApkSha256") or {})
+        if isinstance(inventory.get("pluginPid"), int) and not isinstance(
+            inventory.get("pluginPid"), bool
+        ):
+            sliced_sv["pluginPid"] = inventory.get("pluginPid")
+        if isinstance(inventory.get("surface"), dict):
+            sliced_sv["surface"] = dict(inventory.get("surface") or {})
+        if isinstance(inventory.get("humanReadableOk"), bool):
+            sliced_sv["humanReadableOk"] = inventory.get("humanReadableOk")
+        return sliced_sv
+
     if device:
         checks_in = inventory.get("checks") if isinstance(inventory.get("checks"), dict) else {}
         claimed = resolve_device_evidence_claimed(inventory)
@@ -765,14 +1120,36 @@ def main(argv: list[str]) -> int:
     if not isinstance(inventory, dict):
         emit_failure("MISSING_INPUT", "raw.inventory missing or not object")
 
-    device = is_device_mode(raw.get("mode"), inventory)
-    adapter = is_adapter_mode(raw.get("mode"), inventory) and not device
-    native = is_native_mode(raw.get("mode"), inventory) and not adapter and not device
+    scene_video = is_scene_video_mode(raw.get("mode"), inventory)
+    device = is_device_mode(raw.get("mode"), inventory) and not scene_video
+    adapter = is_adapter_mode(raw.get("mode"), inventory) and not device and not scene_video
+    native = (
+        is_native_mode(raw.get("mode"), inventory)
+        and not adapter
+        and not device
+        and not scene_video
+    )
     if adapter and is_native_mode(raw.get("mode"), inventory):
         # Mode wins over schema ambiguity; adapter modes take precedence.
         native = False
 
-    if device:
+    if scene_video:
+        # Normalize harness aliases before required-key / shape checks.
+        if not inventory.get("packageName"):
+            inventory = dict(inventory)
+            inventory["packageName"] = "com.motif.wallpaperengine"
+        if "deviceEvidenceClaimed" not in inventory and "deviceE4Claim" in inventory:
+            claim = inventory.get("deviceE4Claim")
+            if isinstance(claim, bool):
+                inventory = dict(inventory)
+                inventory["deviceEvidenceClaimed"] = claim
+        missing_keys = [k for k in REQUIRED_SCENE_VIDEO_INVENTORY if k not in inventory]
+        if missing_keys:
+            emit_failure(
+                "INVENTORY_INCOMPLETE",
+                f"scene-video e4 inventory missing keys: {','.join(missing_keys)}",
+            )
+    elif device:
         # Normalize claim/package aliases before required-key checks.
         if "deviceEvidenceClaimed" not in inventory and "deviceE3Claim" in inventory:
             claim = inventory.get("deviceE3Claim")
@@ -834,7 +1211,9 @@ def main(argv: list[str]) -> int:
         )
 
     if not is_stub:
-        if device:
+        if scene_video:
+            shape_errors = validate_scene_video_inventory_shapes(inventory)
+        elif device:
             shape_errors = validate_device_inventory_shapes(inventory)
         elif adapter:
             shape_errors = validate_adapter_inventory_shapes(inventory)
@@ -857,8 +1236,8 @@ def main(argv: list[str]) -> int:
         )
 
     apk_sha = resolve_apk_sha(raw, inventory)
-    # Adapter-contract / device e2-e3 have no official APK sha requirement.
-    if args.require_official_sha and not adapter and not device:
+    # Adapter-contract / device e2-e3 / scene-video e4 have no official APK sha requirement.
+    if args.require_official_sha and not adapter and not device and not scene_video:
         expected = (args.official_sha or OFFICIAL_APK_SHA256).lower()
         if apk_sha:
             if apk_sha.lower() != expected:
@@ -878,14 +1257,19 @@ def main(argv: list[str]) -> int:
         native=native,
         adapter=adapter,
         device=device,
-        require_official_sha=bool(args.require_official_sha) and not adapter and not device,
+        scene_video=scene_video,
+        require_official_sha=(
+            bool(args.require_official_sha) and not adapter and not device and not scene_video
+        ),
         expected_official_sha=args.official_sha or OFFICIAL_APK_SHA256,
         apk_sha=apk_sha,
     )
     # Task EffectiveDone is verify-done only — never claimed from inventory seal.
     effective_done = False
 
-    if device:
+    if scene_video:
+        default_task = "WP-12E"
+    elif device:
         default_task = "WP-12D"
     elif adapter:
         default_task = "WP-12C"
@@ -893,18 +1277,26 @@ def main(argv: list[str]) -> int:
         default_task = "WP-12B"
     else:
         default_task = "WP-12A"
+    # Normalize mode aliases to schema enum for sealed output.
+    sealed_mode = raw["mode"]
+    if scene_video:
+        sealed_mode = "scene-video-e4"
     raw_bytes = raw_path.read_bytes()
     sealed = {
         "schema": SEAL_SCHEMA,
         "taskId": raw.get("taskId") or default_task,
-        "mode": raw["mode"],
+        "mode": sealed_mode,
         "transactionId": raw["transactionId"],
         "runUuid": raw["runUuid"],
         "attemptNo": raw["attemptNo"],
         "sealedAt": utc_now_iso(),
         "pluginCommitSha": raw.get("pluginCommitSha"),
         "inventory": slice_inventory_for_seal(
-            inventory, native=native, adapter=adapter, device=device
+            inventory,
+            native=native,
+            adapter=adapter,
+            device=device,
+            scene_video=scene_video,
         ),
         "hashes": {
             "rawSha256": sha256_bytes(raw_bytes),
@@ -917,6 +1309,27 @@ def main(argv: list[str]) -> int:
             "EffectiveDone is always false here; task EffectiveDone is verify-done only.",
         ],
     }
+    if scene_video:
+        sealed["notes"].append(
+            "scene-video e4 seal: inventorySealed only when scene+video are "
+            "nonBlack nonSolid dual frames; EffectiveDone stays false."
+        )
+        # Promote frame hashes into sealed.hashes (no blobs).
+        inv_slice = sealed["inventory"]
+        samples = inv_slice.get("samples") if isinstance(inv_slice, dict) else {}
+        if isinstance(samples, dict):
+            for kind in ("scene", "video"):
+                sample = samples.get(kind)
+                if not isinstance(sample, dict):
+                    continue
+                for fr in sample.get("frames") or []:
+                    if not isinstance(fr, dict):
+                        continue
+                    sha = fr.get("sha256")
+                    idx = fr.get("index")
+                    if isinstance(sha, str) and sha:
+                        key = f"{kind}Frame{idx}Sha256" if idx is not None else f"{kind}FrameSha256"
+                        sealed["hashes"][key] = sha
     if device:
         sealed["notes"].append(
             "device e2-e3 seal: checks complete + deviceEvidenceClaimed explicit; "
@@ -972,6 +1385,7 @@ def main(argv: list[str]) -> int:
         native=native,
         adapter=adapter,
         device=device,
+        sceneVideo=scene_video,
     )
 
 
