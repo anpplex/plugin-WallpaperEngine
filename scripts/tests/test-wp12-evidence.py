@@ -1498,5 +1498,153 @@ class TestMineradioClosureAndVerifyDone(unittest.TestCase):
             self.assertIs(payload.get("EffectiveDone"), False)
 
 
+class TestWp12bPhaseAndPlugin(unittest.TestCase):
+    """WP-12B experimental: phase fences + plugin-merged allowlist bookkeeping."""
+
+    # origin/main tip after PR #14 — contains WP-12B catalog exactFiles.
+    MAIN_TIP_SHA = "09641e04196a33d8f13ba8c77e326b2d61901047"
+
+    def _init_local_wp12b(self, tmp: str) -> Path:
+        proc = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12B",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertEqual(parse_json_stdout(proc).get("state"), "TREE_FROZEN")
+        txn = Path(tmp) / "wp-12b.json"
+        self.assertTrue(txn.is_file(), f"expected transaction file {txn}")
+        return txn
+
+    def test_wp12b_init_writes_wp12b_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn = self._init_local_wp12b(tmp)
+            receipt = json.loads(txn.read_text(encoding="utf-8"))
+            self.assertEqual(receipt.get("taskId"), "WP-12B")
+            self.assertEqual(receipt.get("state"), "TREE_FROZEN")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+    def test_wp12b_record_red_reaches_red_recorded_missing_needed(self) -> None:
+        """record-phase RED for WP-12B → RED_RECORDED with MISSING_NEEDED."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local_wp12b(tmp)
+            red = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12B",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(red.returncode, 0, msg=red.stdout + red.stderr)
+            payload = parse_json_stdout(red)
+            self.assertEqual(payload.get("state"), "RED_RECORDED")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12b.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "RED_RECORDED")
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 1)
+            event = receipt["phaseEvents"][0]
+            self.assertEqual(event["phase"], "RED")
+            self.assertNotEqual(event["exitCode"], 0)
+            self.assertEqual(event["failureSignature"], "MISSING_NEEDED")
+            self.assertEqual(event["stateAfter"], "RED_RECORDED")
+            self.assertIn("stderrSha256", event)
+            self.assertIn("argv", event)
+
+    def test_wp12b_full_red_to_verify_reaches_verified(self) -> None:
+        """TREE_FROZEN → RED → GREEN → REFACTOR → VERIFY → VERIFIED for WP-12B."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local_wp12b(tmp)
+            expected_states = [
+                ("RED", "RED_RECORDED"),
+                ("GREEN", "GREEN_RECORDED"),
+                ("REFACTOR", "REFACTOR_RECORDED"),
+                ("VERIFY", "VERIFIED"),
+            ]
+            for phase, state in expected_states:
+                proc = run_py(
+                    TXN_PY,
+                    "record-phase",
+                    "--task",
+                    "WP-12B",
+                    "--phase",
+                    phase,
+                    "--transactions",
+                    tmp,
+                )
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    msg=f"phase={phase} rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}",
+                )
+                payload = parse_json_stdout(proc)
+                self.assertEqual(payload.get("state"), state, msg=f"phase={phase}")
+                self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12b.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "VERIFIED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 4)
+            self.assertEqual(receipt["phaseEvents"][0]["failureSignature"], "MISSING_NEEDED")
+            self.assertEqual(receipt["phaseEvents"][0]["exitCode"], 1)
+            for ev in receipt["phaseEvents"][1:]:
+                self.assertEqual(ev["exitCode"], 0)
+
+    def test_wp12b_record_plugin_merged_with_main_tip(self) -> None:
+        """record-plugin-merged with main tip works for WP-12B allowlist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local_wp12b(tmp)
+            for phase in ("RED", "GREEN", "REFACTOR", "VERIFY"):
+                proc = run_py(
+                    TXN_PY,
+                    "record-phase",
+                    "--task",
+                    "WP-12B",
+                    "--phase",
+                    phase,
+                    "--transactions",
+                    tmp,
+                )
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    msg=f"{phase}: {proc.stdout}{proc.stderr}",
+                )
+
+            merged = run_py(
+                TXN_PY,
+                "record-plugin-merged",
+                "--task",
+                "WP-12B",
+                "--merge-sha",
+                self.MAIN_TIP_SHA,
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(merged.returncode, 0, msg=merged.stdout + merged.stderr)
+            payload = parse_json_stdout(merged)
+            self.assertEqual(payload.get("state"), "PLUGIN_COMMITTED")
+            self.assertFalse(payload.get("EffectiveDone"))
+            self.assertEqual(payload.get("mergeSha"), self.MAIN_TIP_SHA)
+
+            receipt = json.loads((Path(tmp) / "wp-12b.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "PLUGIN_COMMITTED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            self.assertEqual(receipt["pluginCommit"]["mode"], "record-plugin-merged")
+            self.assertEqual(receipt["pluginCommit"]["commitSha"], self.MAIN_TIP_SHA)
+            self.assertEqual(receipt["legs"]["plugin"]["state"], "PLUGIN_COMMITTED")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -119,7 +119,7 @@ PHASE_PREREQ = {
     "VERIFY": "REFACTOR_RECORDED",
 }
 
-# Catalog-aligned frozen argv for WP-12A (plugin-root relative).
+# Catalog-aligned frozen argv for WP-12A/B (plugin-root relative).
 # Prefer hardcode over heavy catalog load; matches experimental catalog intent.
 DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
     "WP-12A": {
@@ -134,16 +134,31 @@ DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
         "GREEN": ["bash", "scripts/tests/test-runtime-import.sh"],
         "REFACTOR": ["true"],
         "VERIFY": ["bash", "scripts/tests/test-runtime-import.sh"],
-    }
+    },
+    "WP-12B": {
+        "RED": [
+            "bash",
+            "scripts/verify-native-libs.sh",
+            "--inventory",
+            "scripts/tests/fixtures/native-missing-needed.json",
+            "--mode",
+            "negative-missing-needed",
+        ],
+        "GREEN": ["bash", "scripts/tests/test-native-libs.sh"],
+        "REFACTOR": ["true"],
+        "VERIFY": ["bash", "scripts/tests/test-native-libs.sh"],
+    },
 }
 
-# RED expected stderr token / failureSignature (WP-12A primary catalog RED).
+# RED expected stderr token / failureSignature (primary catalog RED per task).
 DEFAULT_RED_SIGNATURE: dict[str, str] = {
     "WP-12A": "MISSING_DEX",
+    "WP-12B": "MISSING_NEEDED",
 }
 
 # Plugin-leg allowlist paths that must exist at a recorded commit/tree (repo-relative).
-# Matches WP-12A product files already on origin/main via PR #8/#9.
+# WP-12A: product files on origin/main via PR #8/#9.
+# WP-12B: catalog exactFiles + evidence/transaction tooling on origin/main via PR #12/#14.
 PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "WP-12A": (
         "runtime-import/wp12-evidence.schema.json",
@@ -157,13 +172,26 @@ PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
         "scripts/tests/test-wp12-evidence.py",
         "scripts/tests/test-runtime-import.sh",
     ),
+    "WP-12B": (
+        "runtime-import/native-libs.schema.json",
+        "scripts/import-native-libs.sh",
+        "scripts/verify-native-libs.sh",
+        "scripts/tests/test-native-libs.sh",
+        "scripts/tests/fixtures/native-missing-needed.json",
+        "scripts/tests/fixtures/native-wrong-abi.json",
+        # Evidence / transaction bookkeeping (optional but useful for plugin-merged)
+        "scripts/wp12-transaction.py",
+        "scripts/collect-wp12-evidence.py",
+        "scripts/seal-wp12-evidence.py",
+    ),
 }
 
 # Commit subject allowlist for commit-plugin (prefix match, case-sensitive).
 PLUGIN_COMMIT_SUBJECT_PREFIXES: tuple[str, ...] = (
     "feat(wp12a)",
+    "feat(wp12b)",
     "feat(wp12)",
-    "Merge pull request",  # already-merged PR tips (e.g. #8/#9)
+    "Merge pull request",  # already-merged PR tips (e.g. #8/#9/#12/#14)
 )
 
 PREPARE_PLUGIN_PREREQ = frozenset({"VERIFIED", "EVIDENCE_SEALED"})
