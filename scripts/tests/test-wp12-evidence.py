@@ -163,6 +163,273 @@ class TestTransactionRedGreen(unittest.TestCase):
             self.assertEqual(again_payload.get("failureReason"), "EVIDENCE_PATH_EXISTS")
 
 
+class TestPhaseFences(unittest.TestCase):
+    """Real RED→GREEN→REFACTOR→VERIFY phase fences (fail-closed)."""
+
+    def _init_local(self, tmp: str) -> Path:
+        proc = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12A",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertEqual(parse_json_stdout(proc).get("state"), "TREE_FROZEN")
+        return Path(tmp) / "wp-12a.json"
+
+    def test_record_red_advances_to_red_recorded(self) -> None:
+        """init local → record-phase RED → state RED_RECORDED."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local(tmp)
+            red = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(red.returncode, 0, msg=red.stdout + red.stderr)
+            payload = parse_json_stdout(red)
+            self.assertEqual(payload.get("state"), "RED_RECORDED")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12a.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "RED_RECORDED")
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 1)
+            event = receipt["phaseEvents"][0]
+            self.assertEqual(event["phase"], "RED")
+            self.assertNotEqual(event["exitCode"], 0)
+            self.assertEqual(event["failureSignature"], "MISSING_DEX")
+            self.assertEqual(event["stateAfter"], "RED_RECORDED")
+            self.assertIn("stderrSha256", event)
+            self.assertIn("stdoutSha256", event)
+            self.assertIn("argv", event)
+            self.assertIn("recordedAt", event)
+
+    def test_full_red_green_refactor_verify_happy_path(self) -> None:
+        """TREE_FROZEN → RED → GREEN → REFACTOR → VERIFIED."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local(tmp)
+            expected_states = [
+                ("RED", "RED_RECORDED"),
+                ("GREEN", "GREEN_RECORDED"),
+                ("REFACTOR", "REFACTOR_RECORDED"),
+                ("VERIFY", "VERIFIED"),
+            ]
+            for phase, state in expected_states:
+                proc = run_py(
+                    TXN_PY,
+                    "record-phase",
+                    "--task",
+                    "WP-12A",
+                    "--phase",
+                    phase,
+                    "--transactions",
+                    tmp,
+                )
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    msg=f"phase={phase} rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}",
+                )
+                payload = parse_json_stdout(proc)
+                self.assertEqual(payload.get("state"), state, msg=f"phase={phase}")
+                self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12a.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "VERIFIED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+            phases = [e["phase"] for e in receipt["phaseEvents"]]
+            self.assertEqual(phases, ["RED", "GREEN", "REFACTOR", "VERIFY"])
+            # RED non-zero + signature; others exit 0
+            self.assertNotEqual(receipt["phaseEvents"][0]["exitCode"], 0)
+            self.assertEqual(receipt["phaseEvents"][0]["failureSignature"], "MISSING_DEX")
+            for event in receipt["phaseEvents"][1:]:
+                self.assertEqual(event["exitCode"], 0)
+
+            assert_st = run_py(
+                TXN_PY,
+                "assert-state",
+                "--task",
+                "WP-12A",
+                "--expected",
+                "VERIFIED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(assert_st.returncode, 0, msg=assert_st.stdout + assert_st.stderr)
+
+    def test_out_of_order_phase_fails(self) -> None:
+        """Skip/out-of-order phases refuse with OUT_OF_ORDER_PHASE."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local(tmp)
+            # GREEN before RED
+            green = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "GREEN",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(green.returncode, 0, msg=green.stdout + green.stderr)
+            payload = parse_json_stdout(green)
+            self.assertEqual(payload.get("failureReason"), "OUT_OF_ORDER_PHASE")
+
+            # Still TREE_FROZEN
+            status = run_py(TXN_PY, "status", "--task", "WP-12A", "--transactions", tmp)
+            self.assertEqual(parse_json_stdout(status).get("state"), "TREE_FROZEN")
+
+            # After RED, cannot jump to VERIFY
+            red = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(red.returncode, 0, msg=red.stdout + red.stderr)
+            verify = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "VERIFY",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(verify.returncode, 0)
+            self.assertEqual(parse_json_stdout(verify).get("failureReason"), "OUT_OF_ORDER_PHASE")
+
+    def test_cannot_assert_done_unless_already_done(self) -> None:
+        """Caller cannot assert DONE unless receipt already holds DONE+EffectiveDone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local(tmp)
+            # declare-done flag forbidden
+            decl = run_py(
+                TXN_PY,
+                "assert-state",
+                "--task",
+                "WP-12A",
+                "--expected",
+                "TREE_FROZEN",
+                "--declare-done",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(decl.returncode, 0)
+            self.assertEqual(parse_json_stdout(decl).get("failureReason"), "CALLER_DECLARED_DONE")
+
+            # expected DONE while state is TREE_FROZEN
+            done = run_py(
+                TXN_PY,
+                "assert-state",
+                "--task",
+                "WP-12A",
+                "--expected",
+                "DONE",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(done.returncode, 0)
+            self.assertEqual(parse_json_stdout(done).get("failureReason"), "ILLEGAL_STATE")
+
+            # phase command with --declare-done
+            phase_decl = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--declare-done",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(phase_decl.returncode, 0)
+            self.assertEqual(
+                parse_json_stdout(phase_decl).get("failureReason"),
+                "CALLER_DECLARED_DONE",
+            )
+
+    def test_phase_without_init_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(parse_json_stdout(proc).get("failureReason"), "MISSING_RECEIPT")
+
+    def test_begin_run_complete_fence(self) -> None:
+        """Explicit begin-phase / run-phase / complete-phase fence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local(tmp)
+            begin = run_py(
+                TXN_PY,
+                "begin-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(begin.returncode, 0, msg=begin.stdout + begin.stderr)
+            run = run_py(
+                TXN_PY,
+                "run-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(run.returncode, 0, msg=run.stdout + run.stderr)
+            run_payload = parse_json_stdout(run)
+            self.assertNotEqual(run_payload.get("exitCode"), 0)
+            self.assertEqual(run_payload.get("failureSignature"), "MISSING_DEX")
+            # state not advanced until complete
+            status = run_py(TXN_PY, "status", "--task", "WP-12A", "--transactions", tmp)
+            self.assertEqual(parse_json_stdout(status).get("state"), "TREE_FROZEN")
+
+            complete = run_py(
+                TXN_PY,
+                "complete-phase",
+                "--task",
+                "WP-12A",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(complete.returncode, 0, msg=complete.stdout + complete.stderr)
+            self.assertEqual(parse_json_stdout(complete).get("state"), "RED_RECORDED")
+
+
 class TestCollectSealRed(unittest.TestCase):
     def test_red_collect_missing_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
