@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wp12-evidence.schema.json",
+  "title": "WP-12 sealed evidence manifest (scaffold)",
+  "description": "Fail-closed schema for WP-12 evidence seals. Official APK/DEX/SO blobs are never embedded; only hashes and desensitized inventory paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "taskId",
+    "mode",
+    "transactionId",
+    "runUuid",
+    "attemptNo",
+    "sealedAt",
+    "inventory",
+    "hashes",
+    "EffectiveDone"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "wp12-evidence/v1"
+    },
+    "taskId": {
+      "type": "string",
+      "pattern": "^WP-12[A-E]$"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "runtime-inventory",
+        "native-jni",
+        "embedded-adapter",
+        "device-e2e3",
+        "scene-video-e4"
+      ]
+    },
+    "transactionId": {
+      "type": "string",
+      "minLength": 8
+    },
+    "runUuid": {
+      "type": "string",
+      "minLength": 8
+    },
+    "attemptNo": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sealedAt": {
+      "type": "string",
+      "description": "UTC ISO-8601 timestamp"
+    },
+    "pluginCommitSha": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{7,64}$"
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest",
+        "dex",
+        "resources",
+        "authorities",
+        "permissions"
+      ],
+      "properties": {
+        "manifest": {
+          "type": "object",
+          "description": "Desensitized component map; no raw APK bytes"
+        },
+        "dex": {
+          "type": "object",
+          "description": "DEX set listing + content hashes only"
+        },
+        "resources": {
+          "type": "object",
+          "description": "Resource ID / collision inventory"
+        },
+        "authorities": {
+          "description": "ContentProvider authority map (v1 array or legacy object)",
+          "oneOf": [
+            {"type": "array"},
+            {"type": "object"}
+          ]
+        },
+        "permissions": {
+          "type": "object",
+          "description": "Declared / signature permission inventory (v1: declared/uses)"
+        }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "description": "Named sha256 digests of sealed inputs (no blobs)"
+    },
+    "failureSignature": {
+      "type": ["string", "null"],
+      "description": "Catalog failureSignature for RED evidence; null on GREEN seal"
+    },
+    "inventorySealed": {
+      "type": "boolean",
+      "description": "True when non-stub v1 inventory keys and shapes validate"
+    },
+    "inventorySchemaVersion": {
+      "type": ["string", "null"],
+      "description": "Copied from inventory.schemaVersion when present"
+    },
+    "failClosed": {
+      "type": "object",
+      "description": "Desensitized failClosed summary from inventory when present"
+    },
+    "EffectiveDone": {
+      "type": "boolean",
+      "description": "Task EffectiveDone is verify-done only; sealer always writes false"
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

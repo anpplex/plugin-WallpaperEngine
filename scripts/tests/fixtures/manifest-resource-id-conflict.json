@@ -1,0 +1,84 @@
+{
+  "schemaVersion": "wp12a-manifest-map/v1",
+  "packageName": "io.wallpaperengine.weclient",
+  "apkSha256": "75a4d82a92e511f6a869a11dd39dac1b7e35fffc4d54077da8f10305104b2e4a",
+  "versionCode": 4354,
+  "versionName": "2.8.8",
+  "manifest": {
+    "packageName": "io.wallpaperengine.weclient",
+    "applicationProcess": null,
+    "minSdk": 24,
+    "targetSdk": 34,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "dex": {
+    "count": 1,
+    "entries": [
+      {
+        "name": "classes.dex",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sizeBytes": 1000
+      }
+    ]
+  },
+  "resources": {
+    "arscSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "entries": [
+      {
+        "id": "0x7f010001",
+        "type": "string",
+        "name": "app_name",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      {
+        "id": "0x7f010001",
+        "type": "string",
+        "name": "app_name_dup",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    ],
+    "idIndex": {
+      "0x7f010001": "string/app_name"
+    }
+  },
+  "authorities": [
+    {
+      "authority": "io.wallpaperengine.weclient.fileprovider",
+      "componentName": "androidx.core.content.FileProvider",
+      "exported": false,
+      "grantUriPermissions": true
+    }
+  ],
+  "permissions": {
+    "declared": [
+      {
+        "name": "io.wallpaperengine.weclient.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+        "protectionLevel": "signature"
+      }
+    ],
+    "uses": [
+      {
+        "name": "android.permission.INTERNET",
+        "maxSdkVersion": null
+      }
+    ],
+    "signatureKnown": [
+      "io.wallpaperengine.weclient.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+    ]
+  },
+  "components": {
+    "activities": [],
+    "services": [],
+    "receivers": [],
+    "providers": []
+  },
+  "failClosed": {
+    "ok": false,
+    "failures": [
+      {
+        "code": "RESOURCE_ID_CONFLICT",
+        "message": "duplicate resource id 0x7f010001"
+      }
+    ]
+  }
+}

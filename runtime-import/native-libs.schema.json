@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mineradio.local/schemas/wp12b-native-libs/v1",
+  "title": "WP-12B official APK native/JNI dependency closure",
+  "description": "WP-12B desensitized inventory of official APK/split native libraries: per-ABI ELF map, JNI load surface, and transitive DT_NEEDED closure. Verifier fail-closes on MISSING_NEEDED, WRONG_ABI, DUPLICATE_SONAME, EMPTY_ARM64. Product path: runtime-import/native-libs.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageName",
+    "apkSha256",
+    "abis",
+    "jniLoadLibs",
+    "closure",
+    "failClosed"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "wp12b-native-libs/v1"
+    },
+    "packageName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Android package name from the official base APK."
+    },
+    "apkSha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 of the official base APK bytes (hex lowercase)."
+    },
+    "versionCode": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "versionName": {
+      "type": "string"
+    },
+    "abis": {
+      "type": "array",
+      "description": "Per-ABI native library inventory (lib/<abi>/...). arm64-v8a must be non-empty for GREEN; empty arm64 → EMPTY_ARM64.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "libs"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "arm64-v8a",
+              "armeabi-v7a",
+              "armeabi",
+              "x86",
+              "x86_64",
+              "riscv64"
+            ]
+          },
+          "libs": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/nativeLib" }
+          }
+        }
+      }
+    },
+    "jniLoadLibs": {
+      "type": "array",
+      "description": "Java-facing System.loadLibrary names (optional lib/ prefix and .so suffix stripped when present).",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "missingNeeded",
+        "wrongAbi",
+        "duplicateSoname",
+        "systemNeeded"
+      ],
+      "description": "Transitive DT_NEEDED / SONAME / ABI closure scan results. Non-empty missingNeeded, wrongAbi, or duplicateSoname must produce failClosed failures.",
+      "properties": {
+        "missingNeeded": {
+          "type": "array",
+          "description": "Local DT_NEEDED entries not resolved within the same ABI libs and not classified as systemNeeded.",
+          "items": { "$ref": "#/$defs/neededRef" }
+        },
+        "wrongAbi": {
+          "type": "array",
+          "description": "Libs whose ELF machine/class does not match the containing ABI directory.",
+          "items": { "$ref": "#/$defs/wrongAbiRef" }
+        },
+        "duplicateSoname": {
+          "type": "array",
+          "description": "SONAME values claimed by more than one lib within the same ABI.",
+          "items": { "$ref": "#/$defs/duplicateSonameRef" }
+        },
+        "systemNeeded": {
+          "type": "array",
+          "description": "DT_NEEDED entries resolved as public system/NDK libs (e.g. libc.so). Vendor/private system libs must not appear here as success; they fail as MISSING_NEEDED or a dedicated failure when policy rejects them.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "failClosed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "failures"],
+      "description": "Verifier verdict. ok must be true only when failures is empty.",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "MISSING_NEEDED",
+                  "WRONG_ABI",
+                  "DUPLICATE_SONAME",
+                  "EMPTY_ARM64"
+                ]
+              },
+              "message": { "type": "string", "minLength": 1 },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "nativeLib": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "path",
+        "sha256",
+        "sizeBytes",
+        "soname",
+        "needed",
+        "elfClass",
+        "elfMachine"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "File basename (e.g. libfoo.so)."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "APK-relative path (e.g. lib/arm64-v8a/libfoo.so)."
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "soname": {
+          "type": ["string", "null"],
+          "description": "ELF DT_SONAME, or null if unset."
+        },
+        "needed": {
+          "type": "array",
+          "description": "DT_NEEDED entries (sonames / basenames).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "elfClass": {
+          "type": "string",
+          "enum": ["ELFCLASS32", "ELFCLASS64"]
+        },
+        "elfMachine": {
+          "type": "string",
+          "enum": [
+            "EM_ARM",
+            "EM_AARCH64",
+            "EM_386",
+            "EM_X86_64",
+            "EM_RISCV"
+          ]
+        }
+      }
+    },
+    "neededRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["abi", "from", "needed"],
+      "properties": {
+        "abi": {
+          "type": "string",
+          "minLength": 1
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Lib name or path that declared the DT_NEEDED."
+        },
+        "needed": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unresolved DT_NEEDED basename/soname."
+        }
+      }
+    },
+    "wrongAbiRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["abi", "name", "elfMachine", "elfClass"],
+      "properties": {
+        "abi": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "elfMachine": { "type": "string", "minLength": 1 },
+        "elfClass": { "type": "string", "minLength": 1 },
+        "expectedMachine": { "type": "string", "minLength": 1 }
+      }
+    },
+    "duplicateSonameRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["abi", "soname", "libs"],
+      "properties": {
+        "abi": { "type": "string", "minLength": 1 },
+        "soname": { "type": "string", "minLength": 1 },
+        "libs": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

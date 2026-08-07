@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "wp12b-native-libs/v1",
+  "packageName": "io.wallpaperengine.weclient",
+  "apkSha256": "75a4d82a92e511f6a869a11dd39dac1b7e35fffc4d54077da8f10305104b2e4a",
+  "versionCode": 4354,
+  "versionName": "2.8.8",
+  "abis": [
+    {
+      "name": "arm64-v8a",
+      "libs": [
+        {
+          "name": "libwallpaperengine.so",
+          "path": "lib/arm64-v8a/libwallpaperengine.so",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "sizeBytes": 4096000,
+          "soname": "libwallpaperengine.so",
+          "needed": [
+            "libmissing_local_dep.so",
+            "libc.so",
+            "libm.so",
+            "libdl.so",
+            "liblog.so"
+          ],
+          "elfClass": "ELFCLASS64",
+          "elfMachine": "EM_AARCH64"
+        }
+      ]
+    }
+  ],
+  "jniLoadLibs": [
+    "wallpaperengine"
+  ],
+  "closure": {
+    "missingNeeded": [
+      {
+        "abi": "arm64-v8a",
+        "from": "libwallpaperengine.so",
+        "needed": "libmissing_local_dep.so"
+      }
+    ],
+    "wrongAbi": [],
+    "duplicateSoname": [],
+    "systemNeeded": [
+      "libc.so",
+      "libdl.so",
+      "liblog.so",
+      "libm.so"
+    ]
+  },
+  "failClosed": {
+    "ok": false,
+    "failures": [
+      {
+        "code": "MISSING_NEEDED",
+        "message": "arm64-v8a libwallpaperengine.so DT_NEEDED libmissing_local_dep.so not resolved in package libs or public systemNeeded",
+        "detail": "from=libwallpaperengine.so needed=libmissing_local_dep.so abi=arm64-v8a"
+      }
+    ]
+  }
+}
