@@ -1,6 +1,17 @@
+# WP-12 runtime-import fixtures
+
+**Scope:** Plugin worktree scaffold (`runtime-import/` + `scripts/tests/`).
+**Plan:** fail-closed inventory gates for official APK import (WP-12A manifest map, WP-12B native/JNI closure).
+
+| Task | Schema | Fixture basenames |
+| --- | --- | --- |
+| WP-12A | [`manifest-map.schema.json`](./manifest-map.schema.json) (`wp12a-manifest-map/v1`) | four manifest negatives + optional positive |
+| WP-12B | [`native-libs.schema.json`](./native-libs.schema.json) (`wp12b-native-libs/v1`) | two native negatives |
+
+---
+
 # WP-12A DRAFT fixtures (manifest / runtime inventory)
 
-**Scope:** Plugin worktree scaffold (`runtime-import/` + `scripts/tests/test-runtime-import.sh`).
 **Source:** adapted from verification `runs/wp-12a-draft/`.
 **Plan:** four manifest negative fixtures + GREEN positive; fail-closed on unknown signature permissions, authority conflicts, missing DEX, resource ID conflicts.
 
@@ -17,7 +28,7 @@ Verifier policy (stderr signatures, non-zero exit on RED):
 
 ---
 
-## Negative fixtures (4)
+## WP-12A Negative fixtures (4)
 
 Exact basenames for catalog `fixtureBasenames` / RED harness (no directory prefix):
 
@@ -67,7 +78,7 @@ Exact basenames for catalog `fixtureBasenames` / RED harness (no directory prefi
 
 ---
 
-## Positive fixture (1)
+## WP-12A Positive fixture (1)
 
 ### 5. `manifest-inventory-pass.json`
 
@@ -82,7 +93,7 @@ Exact basenames for catalog `fixtureBasenames` / RED harness (no directory prefi
 
 ---
 
-## Catalog wiring (draft intent)
+## WP-12A Catalog wiring (draft intent)
 
 ```text
 fixtureBasenames:
@@ -102,7 +113,7 @@ expectedExit:
   GREEN / REFACTOR / VERIFY: 0
 ```
 
-## Fixture file locations (Plugin worktree)
+## WP-12A Fixture file locations (Plugin worktree)
 
 Catalog basenames live under:
 
@@ -121,7 +132,94 @@ non-zero exit + stderr tokens for the four negatives; exit 0 for the positive.
 
 Schema: `runtime-import/manifest-map.schema.json` (`schemaVersion=wp12a-manifest-map/v1`).
 
-## Out of scope
+---
 
-- Native/ABI/JNI closure (WP-12B / `native-libs.schema.json`).
-- Device evidence collection (`--mode runtime-inventory`); fixtures are host-side import/verify only.
+# WP-12B fixtures (native / ABI / JNI closure)
+
+**Source:** DEVELOPMENT WP-12B allowlist + fail-closed native closure goal (ABI, ELF machine/class, SONAME, DT_NEEDED, transitive deps).
+**Plan:** two native negative fixtures (min); fail-closed on missing local deps and wrong-ABI placement (empty arm64 is also a RED code).
+
+Schema under test: [`native-libs.schema.json`](./native-libs.schema.json) (`schemaVersion=wp12b-native-libs/v1`).
+
+Verifier policy (stderr signatures, non-zero exit on RED):
+
+| Code | When |
+| --- | --- |
+| `MISSING_NEEDED` | a lib's `needed[]` entry is not resolved by another lib in the same ABI and is not in `closure.systemNeeded` |
+| `WRONG_ABI` | ELF `elfMachine`/`elfClass` does not match the containing `abis[].name` directory (e.g. `EM_ARM` under `arm64-v8a`) |
+| `DUPLICATE_SONAME` | two or more libs in the same ABI claim the same non-null `soname` |
+| `EMPTY_ARM64` | no `arm64-v8a` ABI row, or `arm64-v8a.libs` is empty |
+
+Top-level inventory shape:
+
+- `schemaVersion`, `packageName`, `apkSha256`
+- `abis[]`: `{ name, libs[{ name, path, sha256, sizeBytes, soname, needed[], elfClass, elfMachine }] }`
+- `jniLoadLibs[]`: Java-facing load names (`System.loadLibrary` surface)
+- `closure`: `{ missingNeeded[], wrongAbi[], duplicateSoname[], systemNeeded[] }`
+- `failClosed`: `{ ok, failures[{ code, message, detail? }] }`
+
+---
+
+## WP-12B Negative fixtures (2)
+
+Exact basenames for catalog `fixtureBasenames` / RED harness (no directory prefix):
+
+### 1. `native-missing-needed.json`
+
+| Field | Value |
+| --- | --- |
+| Kind | negative |
+| Mutation | `libwallpaperengine.so` DT_NEEDED includes local `libmissing_local_dep.so` which is absent from `abis[].libs` and from `systemNeeded` |
+| Expected exit | non-zero |
+| Expected failure signature | `MISSING_NEEDED` |
+| Match | stderr (and structured `failClosed.failures[].code`) |
+| Inventory notes | arm64-v8a present and ELF-correct; only the local missing dep gate fires |
+
+### 2. `native-wrong-abi.json`
+
+| Field | Value |
+| --- | --- |
+| Kind | negative |
+| Mutation | `lib/arm64-v8a/libwallpaperengine.so` has `elfMachine=EM_ARM` / `elfClass=ELFCLASS32` (32-bit ARM binary under arm64 dir) |
+| Expected exit | non-zero |
+| Expected failure signature | `WRONG_ABI` |
+| Match | stderr |
+| Inventory notes | DT_NEEDED only public system libs; no duplicate SONAME; demonstrates ABI/ELF mismatch (EMPTY_ARM64 is a separate code for empty/missing arm64-v8a) |
+
+---
+
+## WP-12B Catalog wiring (draft intent)
+
+```text
+fixtureBasenames:
+  - native-missing-needed.json
+  - native-wrong-abi.json
+
+failureSignaturePolicy.RED:
+  required: true
+  match: stderr
+  # RED suite must hit MISSING_NEEDED and WRONG_ABI at least once
+
+expectedExit:
+  RED: non-zero (real tool exit; not hard-coded)
+  GREEN / REFACTOR / VERIFY: 0
+```
+
+## WP-12B Fixture file locations (Plugin worktree)
+
+```text
+scripts/tests/fixtures/
+  native-missing-needed.json
+  native-wrong-abi.json
+```
+
+Schema: `runtime-import/native-libs.schema.json` (`schemaVersion=wp12b-native-libs/v1`).
+
+Harness note: WP-12B RED/GREEN extend the WP-12A import/verify scripts (DEVELOPMENT allowlist: modify the three WP-12A scripts) to accept native inventories; fixtures remain host-side import/verify only until device `native-closure` evidence collection.
+
+---
+
+## Out of scope (this FIXTURES.md)
+
+- Device evidence collection (`--mode native-closure` / runtime-inventory); fixtures are host-side schema-shaped inventories.
+- WP-12C+ embedded adapter / device E2E fixtures.
