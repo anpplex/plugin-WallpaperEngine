@@ -2081,7 +2081,7 @@ class TestWp12dPhaseAndCollect(unittest.TestCase):
             self.assertFalse(payload.get("EffectiveDone"))
 
     def test_wp12d_collect_missing_inventory_and_fixture_fails(self) -> None:
-        """Without --inventory/--offline-fixture → MISSING_INPUT (fail-closed)."""
+        """Without --inventory/--offline-fixture/live args → MISSING_INPUT."""
         with tempfile.TemporaryDirectory() as tmp:
             txn_path = self._init_local_wp12d(tmp)
             raw_out = Path(tmp) / "raw.json"
@@ -2101,8 +2101,70 @@ class TestWp12dPhaseAndCollect(unittest.TestCase):
             self.assertEqual(payload.get("failureReason"), "MISSING_INPUT")
             self.assertFalse(raw_out.exists())
 
+    def test_wp12d_collect_live_missing_apks_fails(self) -> None:
+        """Live path with --serial but missing local APKs → MISSING_APK."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--serial",
+                "OFFLINE-SERIAL-DOES-NOT-EXIST-wp12d",
+                "--user",
+                "12",
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "MISSING_APK")
+            self.assertFalse(raw_out.exists())
+
+    def test_wp12d_collect_live_offline_serial_device_offline(self) -> None:
+        """Live path: APKs present + offline serial → DEVICE_OFFLINE (never forge)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            # Local dummy APK files (content irrelevant; sha256 only).
+            mineradio = Path(tmp) / "mineradio.apk"
+            plugin = Path(tmp) / "plugin.apk"
+            official = Path(tmp) / "official.apk"
+            for p in (mineradio, plugin, official):
+                p.write_bytes(b"wp12d-fake-apk\n")
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--serial",
+                "OFFLINE-SERIAL-DOES-NOT-EXIST-wp12d",
+                "--user",
+                "12",
+                "--mineradio-apk",
+                str(mineradio),
+                "--plugin-apk",
+                str(plugin),
+                "--official-apk",
+                str(official),
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "DEVICE_OFFLINE")
+            self.assertFalse(raw_out.exists())
+
     def test_wp12d_collect_serial_offline_device_offline(self) -> None:
-        """--serial with offline adb state → DEVICE_OFFLINE (never forge)."""
+        """--serial with offline adb state on fixture path → DEVICE_OFFLINE."""
         self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
         with tempfile.TemporaryDirectory() as tmp:
             txn_path = self._init_local_wp12d(tmp)

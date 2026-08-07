@@ -256,8 +256,14 @@ assert_cmd 1 "DEVICE_OFFLINE" \
   "forged deviceE3Claim on dry-run fails closed" \
   bash "${VERIFY}" --inventory "${TMP}/forged-e3.json" --mode positive
 
-# --- optional device-positive (skip if no adb device) -----------------------
-log "--- device-positive (optional; gated on adb) ---"
+# --- optional device-positive (live collect + verify; skip if no adb) -------
+log "--- device-positive (optional; gated on adb + env) ---"
+
+# Always assert fail-closed when SERIAL unset
+assert_cmd 1 "MISSING_SERIAL|MISSING_APK|DEVICE_OFFLINE" \
+  "device-positive without env → non-zero fail-closed" \
+  env -u SERIAL -u TARGET_USER -u MINERADIO_APK -u PLUGIN_APK -u OFFICIAL_WE_APK \
+    bash "${VERIFY}" --case device-positive
 
 has_device=0
 if command -v adb >/dev/null 2>&1; then
@@ -267,26 +273,19 @@ if command -v adb >/dev/null 2>&1; then
 fi
 
 if [[ "${has_device}" -eq 0 ]]; then
-  log "SKIP: no adb device online — device-positive not run (fail-closed path still unit-tested via env)"
+  log "SKIP: no adb device online — device-positive live path not run"
   SKIP=$((SKIP + 1))
-  # Still assert fail-closed when SERIAL unset
-  assert_cmd 1 "MISSING_SERIAL|MISSING_APK|DEVICE_OFFLINE" \
-    "device-positive without env → non-zero fail-closed" \
-    env -u SERIAL -u TARGET_USER -u MINERADIO_APK -u PLUGIN_APK -u OFFICIAL_WE_APK \
-      bash "${VERIFY}" --case device-positive
+elif [[ -n "${SERIAL:-}" && -n "${TARGET_USER:-}" \
+    && -n "${MINERADIO_APK:-}" && -n "${PLUGIN_APK:-}" && -n "${OFFICIAL_WE_APK:-}" ]]; then
+  # Full env + online device: live collect must pass hard checks (exit 0).
+  assert_cmd 0 "" \
+    "device-positive with env + online device → exit 0 (live hard checks green)" \
+    bash "${VERIFY}" --case device-positive
 else
-  log "NOTE: adb device present; device-positive still fail-closed without full e2-e3 seal"
-  if [[ -n "${SERIAL:-}" && -n "${TARGET_USER:-}" \
-      && -n "${MINERADIO_APK:-}" && -n "${PLUGIN_APK:-}" && -n "${OFFICIAL_WE_APK:-}" ]]; then
-    # With full env + device, harness intentionally still fails closed until e2-e3 seal exists
-    assert_cmd 1 "DEVICE_OFFLINE|WRONG_USER|MISSING_APK|OFFICIAL_AS_EMBEDDED_HOST" \
-      "device-positive with env still fail-closed (no forged E3 PASS)" \
-      bash "${VERIFY}" --case device-positive
-  else
-    assert_cmd 1 "MISSING_SERIAL|MISSING_APK|DEVICE_OFFLINE|WRONG_USER" \
-      "device-positive partial env → non-zero fail-closed" \
-      bash "${VERIFY}" --case device-positive
-  fi
+  log "NOTE: adb device present but SERIAL/TARGET_USER/APK env incomplete — expect fail-closed"
+  assert_cmd 1 "MISSING_SERIAL|MISSING_APK|DEVICE_OFFLINE|WRONG_USER" \
+    "device-positive partial env → non-zero fail-closed" \
+    bash "${VERIFY}" --case device-positive
 fi
 
 log "summary: pass=${PASS} fail=${FAIL} skip=${SKIP}"
