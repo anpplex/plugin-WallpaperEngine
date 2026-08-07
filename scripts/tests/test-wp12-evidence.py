@@ -1501,8 +1501,8 @@ class TestMineradioClosureAndVerifyDone(unittest.TestCase):
 class TestWp12bPhaseAndPlugin(unittest.TestCase):
     """WP-12B experimental: phase fences + plugin-merged allowlist bookkeeping."""
 
-    # origin/main tip after PR #14 — contains WP-12B catalog exactFiles.
-    MAIN_TIP_SHA = "09641e04196a33d8f13ba8c77e326b2d61901047"
+    # origin/main tip after PR #18 — WP-12B exactFiles + WP-12C adapter + harness.
+    MAIN_TIP_SHA = "bf820a3568222f13d30b5e503d47b33625224332"
 
     def _init_local_wp12b(self, tmp: str) -> Path:
         proc = run_py(
@@ -1644,6 +1644,274 @@ class TestWp12bPhaseAndPlugin(unittest.TestCase):
             self.assertEqual(receipt["pluginCommit"]["mode"], "record-plugin-merged")
             self.assertEqual(receipt["pluginCommit"]["commitSha"], self.MAIN_TIP_SHA)
             self.assertEqual(receipt["legs"]["plugin"]["state"], "PLUGIN_COMMITTED")
+
+
+
+class TestWp12cPhaseAndCollect(unittest.TestCase):
+    """WP-12C experimental: phase fences + adapter-contract collect/seal.
+
+    RED harness (scripts/verify-embedded-adapter.sh) may land in a parallel
+    PR; when missing, RED signature tests skip with a clear message.
+    """
+
+    VERIFY_ADAPTER = PLUGIN_ROOT / "scripts" / "verify-embedded-adapter.sh"
+    PASS_FIXTURE = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "adapter-contract-pass.json"
+    )
+    NEG_FIXTURE = (
+        PLUGIN_ROOT
+        / "scripts"
+        / "tests"
+        / "fixtures"
+        / "adapter-contract-fail-closed.json"
+    )
+
+    def _init_local_wp12c(self, tmp: str) -> Path:
+        proc = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12C",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertEqual(parse_json_stdout(proc).get("state"), "TREE_FROZEN")
+        txn = Path(tmp) / "wp-12c.json"
+        self.assertTrue(txn.is_file(), f"expected transaction file {txn}")
+        return txn
+
+    def test_wp12c_init_writes_wp12c_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn = self._init_local_wp12c(tmp)
+            receipt = json.loads(txn.read_text(encoding="utf-8"))
+            self.assertEqual(receipt.get("taskId"), "WP-12C")
+            self.assertEqual(receipt.get("state"), "TREE_FROZEN")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+    def test_wp12c_record_red_unknown_method_when_harness_present(self) -> None:
+        """record-phase RED for WP-12C → RED_RECORDED with UNKNOWN_METHOD.
+
+        Skips when scripts/verify-embedded-adapter.sh is not landed yet.
+        """
+        if not self.VERIFY_ADAPTER.is_file():
+            self.skipTest(
+                "WP-12C RED harness missing: scripts/verify-embedded-adapter.sh "
+                "(land adapter harness before RED signature pin; primary token "
+                "UNKNOWN_METHOD among UNKNOWN_METHOD/CALLER_APPENDED_ARGS/"
+                "FALLBACK_MASQUERADE)"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local_wp12c(tmp)
+            red = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12C",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(red.returncode, 0, msg=red.stdout + red.stderr)
+            payload = parse_json_stdout(red)
+            self.assertEqual(payload.get("state"), "RED_RECORDED")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12c.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "RED_RECORDED")
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 1)
+            event = receipt["phaseEvents"][0]
+            self.assertEqual(event["phase"], "RED")
+            self.assertNotEqual(event["exitCode"], 0)
+            self.assertEqual(event["failureSignature"], "UNKNOWN_METHOD")
+            self.assertEqual(event["stateAfter"], "RED_RECORDED")
+            self.assertIn("stderrSha256", event)
+            self.assertIn("argv", event)
+            argv = event["argv"]
+            self.assertIn("scripts/verify-embedded-adapter.sh", argv)
+            self.assertIn("adapter-negative", argv)
+
+    def test_wp12c_collect_adapter_contract_from_inventory(self) -> None:
+        """adapter-contract collect from --inventory writes raw EffectiveDone=false."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12c(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "adapter-contract",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            collect_payload = parse_json_stdout(collect)
+            self.assertEqual(collect_payload.get("mode"), "adapter-contract")
+            self.assertFalse(collect_payload.get("EffectiveDone"))
+            self.assertFalse(collect_payload.get("sealed"))
+
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertEqual(raw.get("mode"), "adapter-contract")
+            self.assertFalse(raw.get("EffectiveDone"))
+            self.assertFalse(raw.get("sealed"))
+            inv = raw["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12c-adapter-contract/v1")
+            self.assertEqual(inv.get("packageName"), "com.motif.wallpaperengine")
+            self.assertEqual(
+                inv.get("officialEnginePackage"), "io.wallpaperengine.weclient"
+            )
+            self.assertIs(inv.get("embeddedRuntimeDefault"), False)
+            self.assertTrue(inv.get("failClosed", {}).get("ok"))
+            checks = inv.get("checks") or {}
+            self.assertTrue(checks.get("unknownMethodRejected"))
+            self.assertTrue(checks.get("appendedArgsRejected"))
+            self.assertTrue(checks.get("fallbackMasqueradeRejected"))
+            self.assertTrue(checks.get("defaultUsesOfficial"))
+            # Must not require WP-12A/B keys.
+            for key in ("manifest", "dex", "resources", "authorities", "permissions", "abis"):
+                self.assertNotIn(key, inv)
+
+    def test_wp12c_collect_from_positive_harness_when_present(self) -> None:
+        """Without --inventory, positive harness summary → raw EffectiveDone=false."""
+        if not self.VERIFY_ADAPTER.is_file():
+            self.skipTest(
+                "WP-12C positive harness missing: scripts/verify-embedded-adapter.sh"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12c(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "adapter-contract",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("mode"), "adapter-contract")
+            self.assertFalse(payload.get("EffectiveDone"))
+            self.assertEqual(payload.get("inventorySource"), "harness:adapter-positive")
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertFalse(raw.get("EffectiveDone"))
+            self.assertEqual(raw["inventory"].get("schemaVersion"), "wp12c-adapter-contract/v1")
+            self.assertIs(raw["inventory"].get("embeddedRuntimeDefault"), False)
+
+    def test_wp12c_seal_adapter_pass_inventory_sealed_effective_done_false(self) -> None:
+        """adapter-contract pass fixture → inventorySealed=true; EffectiveDone false."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12c(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "adapter-contract",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_payload = parse_json_stdout(seal)
+            self.assertTrue(seal_payload.get("inventorySealed"))
+            self.assertFalse(seal_payload.get("EffectiveDone"))
+            self.assertTrue(seal_payload.get("adapter"))
+            self.assertFalse(seal_payload.get("native"))
+
+            sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+            self.assertTrue(sealed.get("inventorySealed"))
+            self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertEqual(sealed.get("mode"), "adapter-contract")
+            self.assertEqual(sealed.get("taskId"), "WP-12C")
+            self.assertEqual(
+                sealed.get("inventorySchemaVersion"), "wp12c-adapter-contract/v1"
+            )
+            inv = sealed["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12c-adapter-contract/v1")
+            self.assertIs(inv.get("embeddedRuntimeDefault"), False)
+            self.assertIn("failClosed", inv)
+            self.assertIn("checks", inv)
+            self.assertNotIn("manifest", inv)
+            self.assertNotIn("abis", inv)
+            self.assertTrue(sealed.get("failClosed", {}).get("ok"))
+
+    def test_wp12c_seal_adapter_fail_closed_rejected(self) -> None:
+        """failClosed.ok=false → FAIL_CLOSED_NOT_OK; no inventorySealed claim."""
+        self.assertTrue(self.NEG_FIXTURE.is_file(), f"missing fixture {self.NEG_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12c(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "adapter-contract",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.NEG_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertNotEqual(seal.returncode, 0)
+            payload = parse_json_stdout(seal)
+            self.assertEqual(payload.get("failureReason"), "FAIL_CLOSED_NOT_OK")
+            self.assertFalse(sealed_out.exists())
+
+    def test_wp12c_collect_without_inventory_fails_when_harness_missing(self) -> None:
+        """Without --inventory, missing positive harness → MISSING_TOOL (fail-closed)."""
+        if self.VERIFY_ADAPTER.is_file():
+            self.skipTest(
+                "positive harness present; MISSING_TOOL path only when harness absent"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12c(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "adapter-contract",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "MISSING_TOOL")
+            self.assertFalse(raw_out.exists())
 
 
 class TestNativeClosureSeal(unittest.TestCase):

@@ -17,6 +17,10 @@ Supports:
     wp12b-native): inventorySealed when arm64-v8a has ≥1 lib, failClosed is
     ok (or legacy flags not triggered), and --require-official-sha matches
     when set. Does not require WP-12A inventory keys.
+  - WP-12C adapter-contract (schemaVersion wp12c-adapter-contract/v1):
+    inventorySealed when package isolation fields present, embeddedRuntimeDefault
+    is false, failClosed ok, and checks reject unknown/appended/fallback.
+    EffectiveDone stays false.
 """
 
 from __future__ import annotations
@@ -41,8 +45,26 @@ REQUIRED_NATIVE_INVENTORY = (
     "abis",
     "failClosed",
 )
+# Minimum keys for adapter-contract inventories (WP-12C).
+REQUIRED_ADAPTER_INVENTORY = (
+    "schemaVersion",
+    "packageName",
+    "officialEnginePackage",
+    "embeddedRuntimeDefault",
+    "failClosed",
+    "checks",
+)
 NATIVE_SCHEMA_PREFIX = "wp12b-native"
+ADAPTER_SCHEMA_VERSION = "wp12c-adapter-contract/v1"
+ADAPTER_SCHEMA_PREFIX = "wp12c-adapter-contract"
 NATIVE_MODES = frozenset({"native-closure", "native-jni"})
+ADAPTER_MODES = frozenset({"adapter-contract", "embedded-adapter"})
+REQUIRED_ADAPTER_CHECKS = (
+    "unknownMethodRejected",
+    "appendedArgsRejected",
+    "fallbackMasqueradeRejected",
+    "defaultUsesOfficial",
+)
 # Official WE client class used by WP-12 inventory runs.
 OFFICIAL_APK_SHA256 = "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +106,14 @@ def is_native_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
         return True
     schema_v = inventory.get("schemaVersion")
     return isinstance(schema_v, str) and schema_v.startswith(NATIVE_SCHEMA_PREFIX)
+
+
+def is_adapter_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
+    """Detect WP-12C adapter-contract from raw.mode or inventory.schemaVersion."""
+    if isinstance(mode, str) and mode in ADAPTER_MODES:
+        return True
+    schema_v = inventory.get("schemaVersion")
+    return isinstance(schema_v, str) and schema_v.startswith(ADAPTER_SCHEMA_PREFIX)
 
 
 def arm64_lib_count(inventory: dict[str, Any]) -> int:
@@ -255,11 +285,67 @@ def validate_native_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_adapter_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
+    """Return shape errors for WP-12C adapter-contract inventory fields."""
+    errors: list[str] = []
+
+    schema_v = inventory.get("schemaVersion")
+    if not isinstance(schema_v, str) or not schema_v.startswith(ADAPTER_SCHEMA_PREFIX):
+        errors.append(
+            f"schemaVersion must start with {ADAPTER_SCHEMA_PREFIX!r}, got {schema_v!r}"
+        )
+    elif schema_v != ADAPTER_SCHEMA_VERSION:
+        # Accept only exact v1 for now (fail-closed on unknown future variants).
+        errors.append(
+            f"schemaVersion must be {ADAPTER_SCHEMA_VERSION!r}, got {schema_v!r}"
+        )
+
+    package_name = inventory.get("packageName")
+    if not isinstance(package_name, str) or not package_name.strip():
+        errors.append("packageName must be non-empty string")
+
+    official = inventory.get("officialEnginePackage")
+    if not isinstance(official, str) or not official.strip():
+        errors.append("officialEnginePackage must be non-empty string")
+
+    # Package isolation: plugin package must not equal official engine package.
+    if (
+        isinstance(package_name, str)
+        and isinstance(official, str)
+        and package_name.strip()
+        and official.strip()
+        and package_name.strip() == official.strip()
+    ):
+        errors.append("packageName must differ from officialEnginePackage (isolation)")
+
+    emb_default = inventory.get("embeddedRuntimeDefault")
+    if emb_default is not False:
+        errors.append("embeddedRuntimeDefault must be false (fail-closed default official)")
+
+    fail_closed = inventory.get("failClosed")
+    if not isinstance(fail_closed, dict):
+        errors.append("failClosed must be object")
+
+    checks = inventory.get("checks")
+    if not isinstance(checks, dict):
+        errors.append("checks must be object")
+    else:
+        for key in REQUIRED_ADAPTER_CHECKS:
+            if key not in checks:
+                errors.append(f"checks.{key} missing")
+            elif checks.get(key) is not True:
+                errors.append(f"checks.{key} must be true")
+
+    return errors
+
+
+
 def inventory_is_complete(
     inventory: dict[str, Any],
     *,
     is_stub: bool,
     native: bool,
+    adapter: bool,
     require_official_sha: bool,
     expected_official_sha: str,
     apk_sha: str | None,
@@ -267,6 +353,17 @@ def inventory_is_complete(
     """inventorySealed criteria. EffectiveDone is never derived here."""
     if is_stub:
         return False
+    if adapter:
+        missing = [k for k in REQUIRED_ADAPTER_INVENTORY if k not in inventory]
+        if missing:
+            return False
+        if validate_adapter_inventory_shapes(inventory):
+            return False
+        if not fail_closed_is_ok(inventory.get("failClosed")):
+            return False
+        if inventory.get("embeddedRuntimeDefault") is not False:
+            return False
+        return True
     if native:
         missing = [k for k in REQUIRED_NATIVE_INVENTORY if k not in inventory]
         if missing:
@@ -288,8 +385,31 @@ def inventory_is_complete(
     return len(validate_v1_inventory_shapes(inventory)) == 0
 
 
-def slice_inventory_for_seal(inventory: dict[str, Any], *, native: bool) -> dict[str, Any]:
+def slice_inventory_for_seal(
+    inventory: dict[str, Any],
+    *,
+    native: bool,
+    adapter: bool,
+) -> dict[str, Any]:
     """Preserve inventory shapes for sealed blob (no APK/SO bytes)."""
+    if adapter:
+        checks_in = inventory.get("checks") if isinstance(inventory.get("checks"), dict) else {}
+        sliced_adapter: dict[str, Any] = {
+            "schemaVersion": inventory.get("schemaVersion"),
+            "packageName": inventory.get("packageName"),
+            "officialEnginePackage": inventory.get("officialEnginePackage"),
+            "embeddedRuntimeDefault": inventory.get("embeddedRuntimeDefault"),
+            "failClosed": inventory.get("failClosed")
+            if isinstance(inventory.get("failClosed"), dict)
+            else {"ok": False, "failures": []},
+            "checks": {
+                key: bool(checks_in.get(key) is True) for key in REQUIRED_ADAPTER_CHECKS
+            },
+        }
+        if isinstance(inventory.get("harness"), dict):
+            sliced_adapter["harness"] = dict(inventory.get("harness") or {})
+        return sliced_adapter
+
     if not native:
         authorities = inventory.get("authorities")
         if authorities is None:
@@ -424,9 +544,20 @@ def main(argv: list[str]) -> int:
     if not isinstance(inventory, dict):
         emit_failure("MISSING_INPUT", "raw.inventory missing or not object")
 
-    native = is_native_mode(raw.get("mode"), inventory)
+    adapter = is_adapter_mode(raw.get("mode"), inventory)
+    native = is_native_mode(raw.get("mode"), inventory) and not adapter
+    if adapter and is_native_mode(raw.get("mode"), inventory):
+        # Mode wins over schema ambiguity; adapter modes take precedence.
+        native = False
 
-    if native:
+    if adapter:
+        missing_keys = [k for k in REQUIRED_ADAPTER_INVENTORY if k not in inventory]
+        if missing_keys:
+            emit_failure(
+                "INVENTORY_INCOMPLETE",
+                f"adapter-contract inventory missing keys: {','.join(missing_keys)}",
+            )
+    elif native:
         missing_keys = [k for k in REQUIRED_NATIVE_INVENTORY if k not in inventory]
         if missing_keys:
             emit_failure(
@@ -449,11 +580,12 @@ def main(argv: list[str]) -> int:
         )
 
     if not is_stub:
-        shape_errors = (
-            validate_native_inventory_shapes(inventory)
-            if native
-            else validate_v1_inventory_shapes(inventory)
-        )
+        if adapter:
+            shape_errors = validate_adapter_inventory_shapes(inventory)
+        elif native:
+            shape_errors = validate_native_inventory_shapes(inventory)
+        else:
+            shape_errors = validate_v1_inventory_shapes(inventory)
         if shape_errors:
             emit_failure(
                 "INVENTORY_SHAPE_INVALID",
@@ -469,7 +601,8 @@ def main(argv: list[str]) -> int:
         )
 
     apk_sha = resolve_apk_sha(raw, inventory)
-    if args.require_official_sha:
+    # Adapter-contract has no official APK sha requirement.
+    if args.require_official_sha and not adapter:
         expected = (args.official_sha or OFFICIAL_APK_SHA256).lower()
         if apk_sha:
             if apk_sha.lower() != expected:
@@ -487,14 +620,20 @@ def main(argv: list[str]) -> int:
         inventory,
         is_stub=is_stub,
         native=native,
-        require_official_sha=bool(args.require_official_sha),
+        adapter=adapter,
+        require_official_sha=bool(args.require_official_sha) and not adapter,
         expected_official_sha=args.official_sha or OFFICIAL_APK_SHA256,
         apk_sha=apk_sha,
     )
     # Task EffectiveDone is verify-done only — never claimed from inventory seal.
     effective_done = False
 
-    default_task = "WP-12B" if native else "WP-12A"
+    if adapter:
+        default_task = "WP-12C"
+    elif native:
+        default_task = "WP-12B"
+    else:
+        default_task = "WP-12A"
     raw_bytes = raw_path.read_bytes()
     sealed = {
         "schema": SEAL_SCHEMA,
@@ -505,7 +644,7 @@ def main(argv: list[str]) -> int:
         "attemptNo": raw["attemptNo"],
         "sealedAt": utc_now_iso(),
         "pluginCommitSha": raw.get("pluginCommitSha"),
-        "inventory": slice_inventory_for_seal(inventory, native=native),
+        "inventory": slice_inventory_for_seal(inventory, native=native, adapter=adapter),
         "hashes": {
             "rawSha256": sha256_bytes(raw_bytes),
         },
@@ -517,6 +656,11 @@ def main(argv: list[str]) -> int:
             "EffectiveDone is always false here; task EffectiveDone is verify-done only.",
         ],
     }
+    if adapter:
+        sealed["notes"].append(
+            "adapter-contract seal: package isolation + embeddedRuntimeDefault=false + "
+            "failClosed ok + checks; EffectiveDone stays false."
+        )
     if native:
         sealed["notes"].append(
             "native-closure seal: no WP-12A keys required; inventorySealed needs "
@@ -560,6 +704,7 @@ def main(argv: list[str]) -> int:
         attemptNo=raw["attemptNo"],
         officialApkSha256=apk_sha,
         native=native,
+        adapter=adapter,
     )
 
 
