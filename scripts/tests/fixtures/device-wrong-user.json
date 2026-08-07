@@ -1,0 +1,47 @@
+{
+  "schemaVersion": "wp12d-device-e2e3/v1",
+  "serial": "SYNTHETIC_SERIAL_WRONG_USER",
+  "targetUser": 12,
+  "observedUser": 0,
+  "deviceOnline": true,
+  "contractDryRun": true,
+  "deviceE3Claim": false,
+  "apkPresent": {
+    "mineradio": true,
+    "plugin": true,
+    "officialWe": true
+  },
+  "packageIdentities": {
+    "mineradio": "com.mineradio.app",
+    "plugin": "com.motif.wallpaperengine",
+    "officialWe": "io.wallpaperengine.weclient",
+    "embeddedHost": "com.motif.wallpaperengine"
+  },
+  "signatures": {
+    "mineradio": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "plugin": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "officialWe": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "pluginPid": 4242,
+  "surface": {
+    "present": true,
+    "ownerPid": 4242,
+    "name": "EmbeddedPreview"
+  },
+  "realCaller": {
+    "package": "com.mineradio.app",
+    "uid": 1012345,
+    "isShell": false,
+    "isMineradio": true
+  },
+  "officialNotEmbeddedHost": true,
+  "failClosed": {
+    "ok": false,
+    "failures": [
+      {
+        "code": "WRONG_USER",
+        "message": "observed user 0 does not match target user 12"
+      }
+    ]
+  }
+}
