@@ -94,6 +94,7 @@ def main(argv: list[str]) -> int:
     # Prefer prebuilt inventory; else require official APK path existence (hash only).
     inventory: dict[str, Any] | None = None
     apk_sha: str | None = None
+    inventory_source: str | None = None
     if args.inventory:
         inv_path = Path(args.inventory)
         if not inv_path.is_file():
@@ -102,6 +103,24 @@ def main(argv: list[str]) -> int:
             inventory = json.loads(inv_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             emit_failure("ILLEGAL_STATE", f"inventory unreadable: {exc}")
+        if not isinstance(inventory, dict):
+            emit_failure("ILLEGAL_STATE", "inventory must be a JSON object")
+        inventory_source = str(inv_path.resolve())
+        # Copy apkSha256 from inventory into raw.officialApkSha256 (no APK bytes).
+        inv_sha = inventory.get("apkSha256")
+        if isinstance(inv_sha, str) and inv_sha:
+            apk_sha = inv_sha
+        if args.official_apk:
+            apk = Path(args.official_apk)
+            if apk.is_file():
+                file_sha = sha256_file(apk)
+                if apk_sha and file_sha.lower() != apk_sha.lower():
+                    emit_failure(
+                        "APK_SHA_MISMATCH",
+                        f"inventory.apkSha256 {apk_sha} != file {file_sha}",
+                    )
+                if not apk_sha:
+                    apk_sha = file_sha
     elif args.official_apk:
         apk = Path(args.official_apk)
         if not apk.is_file():
@@ -117,6 +136,7 @@ def main(argv: list[str]) -> int:
             "authorities": {},
             "permissions": {},
         }
+        inventory_source = "stub-from-official-apk"
     else:
         emit_failure(
             "MISSING_INPUT",
@@ -137,6 +157,7 @@ def main(argv: list[str]) -> int:
         "attemptNo": args.attempt_no,
         "collectedAt": utc_now_iso(),
         "officialApkSha256": apk_sha,
+        "inventorySource": inventory_source,
         "inventory": inventory,
         "sealed": False,
         "EffectiveDone": False,
@@ -161,6 +182,8 @@ def main(argv: list[str]) -> int:
         attemptNo=args.attempt_no,
         sealed=False,
         EffectiveDone=False,
+        officialApkSha256=apk_sha,
+        inventorySource=inventory_source,
     )
 
 

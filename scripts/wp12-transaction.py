@@ -13,9 +13,19 @@ Commands:
   run-phase       Execute frozen catalog argv; write run receipt
   complete-phase  Advance state only if run receipt matches expectedExit policy
   record-phase    Convenience: begin + run + complete in one fence (still fail-closed)
+  open-attempt    VERIFIED → EVIDENCE_ATTEMPT_OPEN (--attempt-no N)
+  record-raw      EVIDENCE_ATTEMPT_OPEN → RAW_COLLECTED (--path raw.json)
+  seal-evidence   RAW_COLLECTED → EVIDENCE_SEALED (--path sealed.json)
+  prepare-plugin  VERIFIED|EVIDENCE_SEALED → PLUGIN_PREPARED (bookkeeping only)
+  commit-plugin   PLUGIN_PREPARED → PLUGIN_COMMITTED (--commit-sha proven)
+  record-plugin-merged  VERIFIED|EVIDENCE_SEALED|PLUGIN_PREPARED → PLUGIN_COMMITTED
 
 Serial barriers (phase slice):
   TREE_FROZEN → RED_RECORDED → GREEN_RECORDED → REFACTOR_RECORDED → VERIFIED
+Evidence slice:
+  VERIFIED → EVIDENCE_ATTEMPT_OPEN → RAW_COLLECTED → EVIDENCE_SEALED
+Plugin leg (dry-run bookkeeping; no auto git commit / no forged DONE):
+  VERIFIED|EVIDENCE_SEALED → PLUGIN_PREPARED → PLUGIN_COMMITTED
   (DONE only via later dual-sync verify-done; never from caller.)
 """
 
@@ -119,6 +129,34 @@ DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
 DEFAULT_RED_SIGNATURE: dict[str, str] = {
     "WP-12A": "MISSING_DEX",
 }
+
+# Plugin-leg allowlist paths that must exist at a recorded commit/tree (repo-relative).
+# Matches WP-12A product files already on origin/main via PR #8/#9.
+PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "WP-12A": (
+        "runtime-import/wp12-evidence.schema.json",
+        "runtime-import/wp12-evidence-contract.json",
+        "scripts/wp12-transaction.py",
+        "scripts/collect-wp12-evidence.py",
+        "scripts/seal-wp12-evidence.py",
+        "scripts/update-wp12-progress.py",
+        "scripts/import-official-runtime.sh",
+        "scripts/verify-imported-runtime.sh",
+        "scripts/tests/test-wp12-evidence.py",
+        "scripts/tests/test-runtime-import.sh",
+    ),
+}
+
+# Commit subject allowlist for commit-plugin (prefix match, case-sensitive).
+PLUGIN_COMMIT_SUBJECT_PREFIXES: tuple[str, ...] = (
+    "feat(wp12a)",
+    "feat(wp12)",
+    "Merge pull request",  # already-merged PR tips (e.g. #8/#9)
+)
+
+PREPARE_PLUGIN_PREREQ = frozenset({"VERIFIED", "EVIDENCE_SEALED"})
+COMMIT_PLUGIN_PREREQ = frozenset({"PLUGIN_PREPARED"})
+RECORD_MERGED_PREREQ = frozenset({"VERIFIED", "EVIDENCE_SEALED", "PLUGIN_PREPARED"})
 
 
 def utc_now_iso() -> str:
@@ -434,7 +472,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             bootstrap=receipt.get("bootstrap"),
             frozen=receipt.get("frozen"),
             openPhase=receipt.get("openPhase"),
+            openAttempt=receipt.get("openAttempt"),
             phaseEvents=receipt.get("phaseEvents") or [],
+            attempts=receipt.get("attempts") or [],
+            lastRaw=receipt.get("lastRaw"),
+            lastSealed=receipt.get("lastSealed"),
+            pluginPrepare=receipt.get("pluginPrepare"),
+            pluginCommit=receipt.get("pluginCommit"),
+            legs=receipt.get("legs"),
         )
 
     # Directory inventory
@@ -734,6 +779,748 @@ def cmd_record_phase(args: argparse.Namespace) -> int:
     )
 
 
+def _require_evidence_path(path_str: str | None, label: str) -> Path:
+    if not path_str:
+        fail("MISSING_INPUT", f"missing --path for {label}")
+    path = Path(path_str)
+    if not path.is_file():
+        fail("MISSING_INPUT", f"{label} path not found: {path}")
+    return path
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_open_attempt(args: argparse.Namespace) -> int:
+    """VERIFIED → EVIDENCE_ATTEMPT_OPEN for a new evidence attempt."""
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    attempt_no = args.attempt_no
+    if attempt_no is None or int(attempt_no) < 1:
+        fail("MISSING_INPUT", "open-attempt requires --attempt-no >= 1")
+    attempt_no = int(attempt_no)
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state != "VERIFIED":
+        fail(
+            "OUT_OF_ORDER_EVIDENCE",
+            f"open-attempt requires state=VERIFIED, observed={state}",
+            state=state,
+        )
+
+    attempts = list(receipt.get("attempts") or [])
+    for existing in attempts:
+        if isinstance(existing, dict) and int(existing.get("attemptNo") or 0) == attempt_no:
+            fail(
+                "ATTEMPT_EXISTS",
+                f"attemptNo={attempt_no} already recorded",
+                attemptNo=attempt_no,
+            )
+
+    now = utc_now_iso()
+    attempt = {
+        "attemptNo": attempt_no,
+        "openedAt": now,
+        "state": "EVIDENCE_ATTEMPT_OPEN",
+        "rawPath": None,
+        "rawSha256": None,
+        "sealedPath": None,
+        "sealedSha256": None,
+        "inventorySealed": None,
+        "EffectiveDone": False,
+    }
+    attempts.append(attempt)
+    receipt["attempts"] = attempts
+    receipt["openAttempt"] = {"attemptNo": attempt_no, "openedAt": now}
+    receipt["state"] = "EVIDENCE_ATTEMPT_OPEN"
+    receipt["EffectiveDone"] = False
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "open-attempt",
+        taskId=task_id,
+        state="EVIDENCE_ATTEMPT_OPEN",
+        path=str(path),
+        attemptNo=attempt_no,
+        EffectiveDone=False,
+    )
+
+
+def cmd_record_raw(args: argparse.Namespace) -> int:
+    """EVIDENCE_ATTEMPT_OPEN → RAW_COLLECTED after collect wrote raw evidence."""
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    raw_path = _require_evidence_path(args.path, "record-raw")
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state != "EVIDENCE_ATTEMPT_OPEN":
+        fail(
+            "OUT_OF_ORDER_EVIDENCE",
+            f"record-raw requires state=EVIDENCE_ATTEMPT_OPEN, observed={state}",
+            state=state,
+        )
+
+    open_attempt = receipt.get("openAttempt")
+    if not isinstance(open_attempt, dict) or open_attempt.get("attemptNo") is None:
+        fail("ILLEGAL_STATE", "record-raw requires openAttempt on receipt")
+    attempt_no = int(open_attempt["attemptNo"])
+
+    try:
+        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail("ILLEGAL_STATE", f"raw unreadable: {exc}")
+    if not isinstance(raw, dict):
+        fail("ILLEGAL_STATE", "raw must be a JSON object")
+
+    # Identity must match transaction (fail-closed).
+    if raw.get("transactionId") != receipt.get("transactionId"):
+        fail(
+            "IDENTITY_MISMATCH",
+            "raw.transactionId does not match receipt",
+        )
+    if raw.get("runUuid") != receipt.get("runUuid"):
+        fail("IDENTITY_MISMATCH", "raw.runUuid does not match receipt")
+    if int(raw.get("attemptNo") or 0) != attempt_no:
+        fail(
+            "ATTEMPT_MISMATCH",
+            f"raw.attemptNo={raw.get('attemptNo')} != open attemptNo={attempt_no}",
+        )
+
+    raw_sha = _sha256_file(raw_path)
+    now = utc_now_iso()
+    attempts = list(receipt.get("attempts") or [])
+    found = False
+    for entry in attempts:
+        if isinstance(entry, dict) and int(entry.get("attemptNo") or 0) == attempt_no:
+            entry["rawPath"] = str(raw_path.resolve())
+            entry["rawSha256"] = raw_sha
+            entry["rawRecordedAt"] = now
+            entry["state"] = "RAW_COLLECTED"
+            entry["officialApkSha256"] = raw.get("officialApkSha256")
+            found = True
+            break
+    if not found:
+        fail("ILLEGAL_STATE", f"open attemptNo={attempt_no} missing from attempts[]")
+
+    receipt["attempts"] = attempts
+    receipt["state"] = "RAW_COLLECTED"
+    receipt["EffectiveDone"] = False
+    receipt["lastRaw"] = {
+        "attemptNo": attempt_no,
+        "path": str(raw_path.resolve()),
+        "sha256": raw_sha,
+        "recordedAt": now,
+    }
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "record-raw",
+        taskId=task_id,
+        state="RAW_COLLECTED",
+        path=str(path),
+        attemptNo=attempt_no,
+        rawPath=str(raw_path.resolve()),
+        rawSha256=raw_sha,
+        EffectiveDone=False,
+    )
+
+
+def cmd_seal_evidence(args: argparse.Namespace) -> int:
+    """RAW_COLLECTED → EVIDENCE_SEALED after sealer wrote sealed evidence.
+
+    Does NOT set EffectiveDone=true (task EffectiveDone is verify-done only).
+    Records inventorySealed from sealed JSON when present.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    sealed_path = _require_evidence_path(args.path, "seal-evidence")
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state != "RAW_COLLECTED":
+        fail(
+            "OUT_OF_ORDER_EVIDENCE",
+            f"seal-evidence requires state=RAW_COLLECTED, observed={state}",
+            state=state,
+        )
+
+    open_attempt = receipt.get("openAttempt")
+    if not isinstance(open_attempt, dict) or open_attempt.get("attemptNo") is None:
+        fail("ILLEGAL_STATE", "seal-evidence requires openAttempt on receipt")
+    attempt_no = int(open_attempt["attemptNo"])
+
+    try:
+        sealed = json.loads(sealed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail("ILLEGAL_STATE", f"sealed unreadable: {exc}")
+    if not isinstance(sealed, dict):
+        fail("ILLEGAL_STATE", "sealed must be a JSON object")
+
+    if sealed.get("transactionId") != receipt.get("transactionId"):
+        fail("IDENTITY_MISMATCH", "sealed.transactionId does not match receipt")
+    if sealed.get("runUuid") != receipt.get("runUuid"):
+        fail("IDENTITY_MISMATCH", "sealed.runUuid does not match receipt")
+    if int(sealed.get("attemptNo") or 0) != attempt_no:
+        fail(
+            "ATTEMPT_MISMATCH",
+            f"sealed.attemptNo={sealed.get('attemptNo')} != open attemptNo={attempt_no}",
+        )
+    # Refuse forged task EffectiveDone on seal attach.
+    if sealed.get("EffectiveDone") is True:
+        fail(
+            "FORGED_EFFECTIVE_DONE",
+            "sealed.EffectiveDone must be false; task EffectiveDone is verify-done only",
+        )
+
+    sealed_sha = _sha256_file(sealed_path)
+    inventory_sealed = bool(sealed.get("inventorySealed"))
+    now = utc_now_iso()
+    attempts = list(receipt.get("attempts") or [])
+    found = False
+    for entry in attempts:
+        if isinstance(entry, dict) and int(entry.get("attemptNo") or 0) == attempt_no:
+            entry["sealedPath"] = str(sealed_path.resolve())
+            entry["sealedSha256"] = sealed_sha
+            entry["sealedAt"] = now
+            entry["state"] = "EVIDENCE_SEALED"
+            entry["inventorySealed"] = inventory_sealed
+            entry["EffectiveDone"] = False
+            found = True
+            break
+    if not found:
+        fail("ILLEGAL_STATE", f"open attemptNo={attempt_no} missing from attempts[]")
+
+    receipt["attempts"] = attempts
+    receipt["state"] = "EVIDENCE_SEALED"
+    receipt["EffectiveDone"] = False
+    receipt["openAttempt"] = None
+    receipt["lastSealed"] = {
+        "attemptNo": attempt_no,
+        "path": str(sealed_path.resolve()),
+        "sha256": sealed_sha,
+        "inventorySealed": inventory_sealed,
+        "EffectiveDone": False,
+        "recordedAt": now,
+    }
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "seal-evidence",
+        taskId=task_id,
+        state="EVIDENCE_SEALED",
+        path=str(path),
+        attemptNo=attempt_no,
+        sealedPath=str(sealed_path.resolve()),
+        sealedSha256=sealed_sha,
+        inventorySealed=inventory_sealed,
+        EffectiveDone=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plugin leg bookkeeping (dry-run only — records operator SHAs; no auto-commit)
+# ---------------------------------------------------------------------------
+
+
+def _git(
+    *git_args: str,
+    cwd: Path | None = None,
+    timeout: float | None = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *git_args],
+            cwd=str(cwd or PLUGIN_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["git", *git_args],
+            returncode=124,
+            stdout="",
+            stderr=f"git timeout after {timeout}s: {' '.join(git_args)}",
+        )
+
+
+def _require_hex_sha(raw: str | None, *, label: str, lengths: tuple[int, ...] = (40,)) -> str:
+    if not raw:
+        fail("MISSING_INPUT", f"missing {label}")
+    value = raw.strip().lower()
+    if not all(c in "0123456789abcdef" for c in value):
+        fail("INVALID_SHA", f"{label} must be lowercase hex, got {raw!r}")
+    if len(value) not in lengths and not (7 <= len(value) <= 40):
+        fail("INVALID_SHA", f"{label} must be 7-40 hex chars, got len={len(value)}")
+    return value
+
+
+def _resolve_git_object(spec: str, *, expect_type: str | None = None) -> tuple[str, str]:
+    """Resolve rev to full 40-hex SHA and object type via git cat-file (fail-closed)."""
+    proc = _git("cat-file", "-t", spec)
+    if proc.returncode != 0:
+        fail(
+            "GIT_OBJECT_MISSING",
+            f"git cat-file cannot resolve {spec!r}: {(proc.stderr or proc.stdout or '').strip()}",
+            spec=spec,
+        )
+    obj_type = (proc.stdout or "").strip()
+    if expect_type and obj_type != expect_type:
+        fail(
+            "GIT_OBJECT_TYPE_MISMATCH",
+            f"expected {expect_type} for {spec!r}, got {obj_type}",
+            spec=spec,
+            objectType=obj_type,
+        )
+    full = _git("rev-parse", spec)
+    if full.returncode != 0:
+        fail("GIT_OBJECT_MISSING", f"git rev-parse failed for {spec!r}")
+    sha = (full.stdout or "").strip().lower()
+    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+        fail("INVALID_SHA", f"rev-parse returned non-40hex for {spec!r}: {sha!r}")
+    return sha, obj_type
+
+
+def _git_head_sha() -> str:
+    sha, _ = _resolve_git_object("HEAD", expect_type="commit")
+    return sha
+
+
+def _git_commit_subject(commit_sha: str) -> str:
+    proc = _git("log", "-1", "--format=%s", commit_sha)
+    if proc.returncode != 0:
+        fail("GIT_OBJECT_MISSING", f"cannot read subject for {commit_sha}")
+    return (proc.stdout or "").strip()
+
+
+def _subject_allowed(subject: str) -> bool:
+    return any(subject.startswith(prefix) for prefix in PLUGIN_COMMIT_SUBJECT_PREFIXES)
+
+
+def _is_ancestor_or_equal(ancestor: str, descendant: str) -> bool:
+    if ancestor == descendant:
+        return True
+    proc = _git("merge-base", "--is-ancestor", ancestor, descendant)
+    return proc.returncode == 0
+
+
+def _allowlist_for(task_id: str) -> tuple[str, ...]:
+    paths = PLUGIN_ALLOWLIST.get(task_id)
+    if not paths:
+        fail("NO_PLUGIN_ALLOWLIST", f"no plugin allowlist for task={task_id}")
+    return paths
+
+
+def _verify_allowlist_at(commit_or_tree: str, paths: Sequence[str]) -> list[str]:
+    """Prove each allowlist path exists as a blob at commit/tree. Returns missing paths."""
+    missing: list[str] = []
+    for rel in paths:
+        # Prefer commit:path via cat-file; works for both commit and tree^{}/path forms.
+        # For a commit SHA, "SHA:path" resolves the blob.
+        # For a tree SHA, use "SHA:path" as well (git allows tree:path).
+        proc = _git("cat-file", "-e", f"{commit_or_tree}:{rel}")
+        if proc.returncode != 0:
+            missing.append(rel)
+    return missing
+
+
+def _ensure_legs(receipt: dict[str, Any]) -> dict[str, Any]:
+    legs = receipt.get("legs")
+    if not isinstance(legs, dict):
+        legs = {}
+    for key in ("plugin", "evidence", "closure"):
+        if key not in legs or not isinstance(legs.get(key), dict):
+            legs[key] = dict(legs.get(key) or {}) if isinstance(legs.get(key), dict) else {}
+    receipt["legs"] = legs
+    return legs
+
+
+def cmd_prepare_plugin(args: argparse.Namespace) -> int:
+    """Record prepared plugin tree identity only (no git commit).
+
+    Requires VERIFIED or EVIDENCE_SEALED (tolerate evidence attach before plugin leg).
+    Prefer operator --prepared-tree 40hex. Without it, verify allowlist paths exist
+    at HEAD and record headSha (implementation already on origin/main via PR #8/#9).
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in PREPARE_PLUGIN_PREREQ:
+        fail(
+            "OUT_OF_ORDER_PLUGIN",
+            f"prepare-plugin requires state in {sorted(PREPARE_PLUGIN_PREREQ)}, observed={state}",
+            state=state,
+            requiredStates=sorted(PREPARE_PLUGIN_PREREQ),
+        )
+
+    allowlist = list(_allowlist_for(task_id))
+    head_sha = _git_head_sha()
+    prepared_tree_arg = getattr(args, "prepared_tree", None)
+    note: str
+
+    if prepared_tree_arg:
+        raw_tree = _require_hex_sha(prepared_tree_arg, label="--prepared-tree", lengths=(40,))
+        if len(raw_tree) != 40:
+            # Resolve short form if operator passed abbreviated.
+            tree_sha, _ = _resolve_git_object(raw_tree, expect_type="tree")
+        else:
+            tree_sha, _ = _resolve_git_object(raw_tree, expect_type="tree")
+        missing = _verify_allowlist_at(tree_sha, allowlist)
+        if missing:
+            fail(
+                "ALLOWLIST_MISSING",
+                f"prepared-tree missing allowlist paths: {missing}",
+                missing=missing,
+                preparedTree=tree_sha,
+            )
+        note = "operator-supplied prepared-tree recorded; no git commit performed"
+        mode = "prepared-tree"
+    else:
+        # Safer default for already-merged implementation: prove allowlist at HEAD.
+        missing = _verify_allowlist_at(head_sha, allowlist)
+        if missing:
+            fail(
+                "ALLOWLIST_MISSING",
+                f"HEAD missing allowlist paths (pass --prepared-tree when staging): {missing}",
+                missing=missing,
+                headSha=head_sha,
+            )
+        # Record tree identity of HEAD without writing a new tree.
+        tree_sha, _ = _resolve_git_object(f"{head_sha}^{{tree}}", expect_type="tree")
+        note = (
+            "implementation already on origin/main via PR #8/#9; "
+            "recorded headSha/tree without git commit"
+        )
+        mode = "head-allowlist"
+
+    now = utc_now_iso()
+    prepare_record = {
+        "preparedAt": now,
+        "preparedTree": tree_sha,
+        "headSha": head_sha,
+        "allowlist": allowlist,
+        "mode": mode,
+        "note": note,
+        "priorState": state,
+    }
+    receipt["pluginPrepare"] = prepare_record
+    legs = _ensure_legs(receipt)
+    legs["plugin"] = {
+        **dict(legs.get("plugin") or {}),
+        "preparedTree": tree_sha,
+        "headSha": head_sha,
+        "preparedAt": now,
+        "state": "PLUGIN_PREPARED",
+    }
+    receipt["state"] = "PLUGIN_PREPARED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(f"prepare-plugin: {note}")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "prepare-plugin",
+        taskId=task_id,
+        state="PLUGIN_PREPARED",
+        path=str(path),
+        preparedTree=tree_sha,
+        headSha=head_sha,
+        mode=mode,
+        note=note,
+        EffectiveDone=False,
+    )
+
+
+def cmd_commit_plugin(args: argparse.Namespace) -> int:
+    """Record operator-provided plugin commit SHA → PLUGIN_COMMITTED (no git commit).
+
+    Requires PLUGIN_PREPARED. Proves commit exists, is ancestor of HEAD (or equals
+    HEAD), and subject matches feat(wp12a)|feat(wp12)|Merge pull request.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    commit_raw = getattr(args, "commit_sha", None)
+    if not commit_raw:
+        fail("MISSING_INPUT", "commit-plugin requires --commit-sha")
+    _require_hex_sha(commit_raw, label="--commit-sha")
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in COMMIT_PLUGIN_PREREQ:
+        fail(
+            "OUT_OF_ORDER_PLUGIN",
+            f"commit-plugin requires state=PLUGIN_PREPARED, observed={state}",
+            state=state,
+        )
+
+    commit_sha, _ = _resolve_git_object(commit_raw.strip().lower(), expect_type="commit")
+    head_sha = _git_head_sha()
+    if not _is_ancestor_or_equal(commit_sha, head_sha):
+        fail(
+            "COMMIT_NOT_ON_HEAD",
+            f"commit {commit_sha} is not HEAD and not an ancestor of HEAD={head_sha}",
+            commitSha=commit_sha,
+            headSha=head_sha,
+        )
+
+    subject = _git_commit_subject(commit_sha)
+    if not _subject_allowed(subject):
+        fail(
+            "COMMIT_SUBJECT_REJECTED",
+            f"commit subject not in allowlist prefixes {list(PLUGIN_COMMIT_SUBJECT_PREFIXES)}: {subject!r}",
+            subject=subject,
+            commitSha=commit_sha,
+        )
+
+    allowlist = list(_allowlist_for(task_id))
+    missing = _verify_allowlist_at(commit_sha, allowlist)
+    if missing:
+        fail(
+            "ALLOWLIST_MISSING",
+            f"commit missing allowlist paths: {missing}",
+            missing=missing,
+            commitSha=commit_sha,
+        )
+
+    tree_sha, _ = _resolve_git_object(f"{commit_sha}^{{tree}}", expect_type="tree")
+    prepared = receipt.get("pluginPrepare") if isinstance(receipt.get("pluginPrepare"), dict) else {}
+    prepared_tree = prepared.get("preparedTree")
+    if prepared_tree and prepared_tree != tree_sha:
+        # Soft note only when operator recorded a different prepared tree; still fail-closed
+        # if allowlist paths at commit differ — already checked above. Tree mismatch is
+        # informative for dry-run when HEAD advanced past prepare.
+        pass
+
+    now = utc_now_iso()
+    commit_record = {
+        "committedAt": now,
+        "commitSha": commit_sha,
+        "treeSha": tree_sha,
+        "subject": subject,
+        "headSha": head_sha,
+        "allowlist": allowlist,
+        "mode": "commit-sha",
+        "note": "operator-supplied commit recorded; no git commit performed",
+        "priorState": state,
+    }
+    receipt["pluginCommit"] = commit_record
+    legs = _ensure_legs(receipt)
+    legs["plugin"] = {
+        **dict(legs.get("plugin") or {}),
+        "commitSha": commit_sha,
+        "treeSha": tree_sha,
+        "subject": subject,
+        "committedAt": now,
+        "state": "PLUGIN_COMMITTED",
+    }
+    receipt["state"] = "PLUGIN_COMMITTED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(f"commit-plugin: recorded {commit_sha[:12]} subject={subject!r}")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "commit-plugin",
+        taskId=task_id,
+        state="PLUGIN_COMMITTED",
+        path=str(path),
+        commitSha=commit_sha,
+        treeSha=tree_sha,
+        subject=subject,
+        EffectiveDone=False,
+    )
+
+
+def cmd_record_plugin_merged(args: argparse.Namespace) -> int:
+    """Record already-merged plugin implementation → PLUGIN_COMMITTED.
+
+    For local automation when code is already on origin/main (PR #8/#9).
+    Requires VERIFIED|EVIDENCE_SEALED|PLUGIN_PREPARED. Proves merge-sha is a commit,
+    allowlist paths exist at that commit, and (when origin/main is available) the
+    merge is an ancestor of origin/main tip or equals it.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    merge_raw = getattr(args, "merge_sha", None)
+    if not merge_raw:
+        fail("MISSING_INPUT", "record-plugin-merged requires --merge-sha")
+    _require_hex_sha(merge_raw, label="--merge-sha")
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in RECORD_MERGED_PREREQ:
+        fail(
+            "OUT_OF_ORDER_PLUGIN",
+            f"record-plugin-merged requires state in {sorted(RECORD_MERGED_PREREQ)}, observed={state}",
+            state=state,
+            requiredStates=sorted(RECORD_MERGED_PREREQ),
+        )
+
+    merge_sha, _ = _resolve_git_object(merge_raw.strip().lower(), expect_type="commit")
+    allowlist = list(_allowlist_for(task_id))
+    missing = _verify_allowlist_at(merge_sha, allowlist)
+    if missing:
+        fail(
+            "ALLOWLIST_MISSING",
+            f"merge-sha missing allowlist paths: {missing}",
+            missing=missing,
+            mergeSha=merge_sha,
+        )
+
+    # Prefer origin/main containment; fall back to local main / HEAD ancestry.
+    main_tip: str | None = None
+    main_source = None
+    for ref in ("refs/remotes/origin/main", "origin/main", "refs/heads/main", "main"):
+        proc = _git("rev-parse", "--verify", ref)
+        if proc.returncode == 0:
+            tip = (proc.stdout or "").strip().lower()
+            if len(tip) == 40:
+                main_tip = tip
+                main_source = ref
+                break
+
+    if main_tip is not None:
+        if not _is_ancestor_or_equal(merge_sha, main_tip):
+            fail(
+                "MERGE_NOT_ON_MAIN",
+                f"merge-sha {merge_sha} is not contained in {main_source}={main_tip}",
+                mergeSha=merge_sha,
+                mainTip=main_tip,
+                mainSource=main_source,
+            )
+    else:
+        # No main ref — require merge is on current HEAD line.
+        head_sha = _git_head_sha()
+        if not _is_ancestor_or_equal(merge_sha, head_sha):
+            fail(
+                "MERGE_NOT_ON_HEAD",
+                f"merge-sha {merge_sha} not on HEAD={head_sha} and origin/main unavailable",
+                mergeSha=merge_sha,
+                headSha=head_sha,
+            )
+        main_tip = head_sha
+        main_source = "HEAD"
+
+    # Optional ls-remote cross-check (skip/offline on timeout; fatal only when
+    # ls-remote succeeds and returned tip does not contain merge-sha).
+    ls = _git("ls-remote", "origin", "refs/heads/main", timeout=8.0)
+    ls_remote_tip = None
+    if ls.returncode == 0 and (ls.stdout or "").strip():
+        first = (ls.stdout or "").splitlines()[0].split()
+        if first and len(first[0]) == 40:
+            ls_remote_tip = first[0].lower()
+            if not _is_ancestor_or_equal(merge_sha, ls_remote_tip):
+                fail(
+                    "MERGE_NOT_ON_ORIGIN_MAIN",
+                    f"ls-remote origin/main={ls_remote_tip} does not contain merge-sha {merge_sha}",
+                    mergeSha=merge_sha,
+                    originMain=ls_remote_tip,
+                )
+
+    subject = _git_commit_subject(merge_sha)
+    tree_sha, _ = _resolve_git_object(f"{merge_sha}^{{tree}}", expect_type="tree")
+    head_sha = _git_head_sha()
+    now = utc_now_iso()
+    note = (
+        "implementation already merged on origin/main via PR #8/#9; "
+        "recorded merge-sha without git commit"
+    )
+    # Auto-fill prepare if skipped (merged path may jump VERIFIED → PLUGIN_COMMITTED).
+    if not isinstance(receipt.get("pluginPrepare"), dict):
+        receipt["pluginPrepare"] = {
+            "preparedAt": now,
+            "preparedTree": tree_sha,
+            "headSha": head_sha,
+            "allowlist": allowlist,
+            "mode": "record-plugin-merged-implicit",
+            "note": "implicit prepare while recording merged implementation",
+            "priorState": state,
+        }
+
+    commit_record = {
+        "committedAt": now,
+        "commitSha": merge_sha,
+        "mergeSha": merge_sha,
+        "treeSha": tree_sha,
+        "subject": subject,
+        "headSha": head_sha,
+        "mainTip": main_tip,
+        "mainSource": main_source,
+        "lsRemoteMain": ls_remote_tip,
+        "allowlist": allowlist,
+        "mode": "record-plugin-merged",
+        "note": note,
+        "priorState": state,
+    }
+    receipt["pluginCommit"] = commit_record
+    legs = _ensure_legs(receipt)
+    legs["plugin"] = {
+        **dict(legs.get("plugin") or {}),
+        "commitSha": merge_sha,
+        "mergeSha": merge_sha,
+        "treeSha": tree_sha,
+        "subject": subject,
+        "committedAt": now,
+        "state": "PLUGIN_COMMITTED",
+        "mode": "record-plugin-merged",
+    }
+    receipt["state"] = "PLUGIN_COMMITTED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(f"record-plugin-merged: {merge_sha[:12]} via {main_source}")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "record-plugin-merged",
+        taskId=task_id,
+        state="PLUGIN_COMMITTED",
+        path=str(path),
+        mergeSha=merge_sha,
+        commitSha=merge_sha,
+        treeSha=tree_sha,
+        subject=subject,
+        mainTip=main_tip,
+        mainSource=main_source,
+        lsRemoteMain=ls_remote_tip,
+        note=note,
+        EffectiveDone=False,
+    )
+
+
 COMMANDS = {
     "init": cmd_init,
     "status": cmd_status,
@@ -742,6 +1529,12 @@ COMMANDS = {
     "run-phase": cmd_run_phase,
     "complete-phase": cmd_complete_phase,
     "record-phase": cmd_record_phase,
+    "open-attempt": cmd_open_attempt,
+    "record-raw": cmd_record_raw,
+    "seal-evidence": cmd_seal_evidence,
+    "prepare-plugin": cmd_prepare_plugin,
+    "commit-plugin": cmd_commit_plugin,
+    "record-plugin-merged": cmd_record_plugin_merged,
 }
 
 
@@ -768,6 +1561,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="mark init as local dry-run TREE_FROZEN (no push claim)",
     )
+    parser.add_argument(
+        "--attempt-no",
+        type=int,
+        help="evidence attempt number for open-attempt",
+    )
+    parser.add_argument(
+        "--path",
+        help="path to raw/sealed evidence JSON for record-raw / seal-evidence",
+    )
+    parser.add_argument(
+        "--prepared-tree",
+        dest="prepared_tree",
+        help="operator-approved tree SHA (40 hex) for prepare-plugin; no git write-tree",
+    )
+    parser.add_argument(
+        "--commit-sha",
+        dest="commit_sha",
+        help="existing commit SHA for commit-plugin bookkeeping (no git commit)",
+    )
+    parser.add_argument(
+        "--merge-sha",
+        dest="merge_sha",
+        help="already-merged commit SHA for record-plugin-merged (e.g. origin/main tip)",
+    )
     return parser.parse_args(argv)
 
 
@@ -775,7 +1592,9 @@ def main(argv: list[str]) -> int:
     if not argv:
         fail(
             "UNKNOWN_COMMAND",
-            "missing command (init|status|assert-state|begin-phase|run-phase|complete-phase|record-phase)",
+            "missing command (init|status|assert-state|begin-phase|run-phase|"
+            "complete-phase|record-phase|open-attempt|record-raw|seal-evidence|"
+            "prepare-plugin|commit-plugin|record-plugin-merged)",
         )
     args = parse_args(argv)
     return COMMANDS[args.command](args)
