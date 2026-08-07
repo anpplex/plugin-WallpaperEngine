@@ -1,0 +1,42 @@
+{
+  "schemaVersion": "wp12d-device-e2e3/v1",
+  "serial": "SYNTHETIC_SERIAL_OFFLINE_PASS",
+  "targetUser": 12,
+  "observedUser": 12,
+  "deviceOnline": false,
+  "contractDryRun": true,
+  "deviceE3Claim": false,
+  "apkPresent": {
+    "mineradio": true,
+    "plugin": true,
+    "officialWe": true
+  },
+  "packageIdentities": {
+    "mineradio": "com.mineradio.app",
+    "plugin": "com.motif.wallpaperengine",
+    "officialWe": "io.wallpaperengine.weclient",
+    "embeddedHost": "com.motif.wallpaperengine"
+  },
+  "signatures": {
+    "mineradio": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "plugin": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "officialWe": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "pluginPid": 7777,
+  "surface": {
+    "present": true,
+    "ownerPid": 7777,
+    "name": "EmbeddedPreview"
+  },
+  "realCaller": {
+    "package": "com.mineradio.app",
+    "uid": 1012345,
+    "isShell": false,
+    "isMineradio": true
+  },
+  "officialNotEmbeddedHost": true,
+  "failClosed": {
+    "ok": true,
+    "failures": []
+  }
+}

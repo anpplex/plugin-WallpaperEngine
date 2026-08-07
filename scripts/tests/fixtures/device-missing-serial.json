@@ -1,0 +1,47 @@
+{
+  "schemaVersion": "wp12d-device-e2e3/v1",
+  "serial": "",
+  "targetUser": 12,
+  "observedUser": null,
+  "deviceOnline": false,
+  "contractDryRun": true,
+  "deviceE3Claim": false,
+  "apkPresent": {
+    "mineradio": true,
+    "plugin": true,
+    "officialWe": true
+  },
+  "packageIdentities": {
+    "mineradio": "com.mineradio.app",
+    "plugin": "com.motif.wallpaperengine",
+    "officialWe": "io.wallpaperengine.weclient",
+    "embeddedHost": "com.motif.wallpaperengine"
+  },
+  "signatures": {
+    "mineradio": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "plugin": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "officialWe": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "pluginPid": 0,
+  "surface": {
+    "present": false,
+    "ownerPid": 0,
+    "name": null
+  },
+  "realCaller": {
+    "package": null,
+    "uid": null,
+    "isShell": false,
+    "isMineradio": false
+  },
+  "officialNotEmbeddedHost": true,
+  "failClosed": {
+    "ok": false,
+    "failures": [
+      {
+        "code": "MISSING_SERIAL",
+        "message": "device serial missing or empty"
+      }
+    ]
+  }
+}
