@@ -21,6 +21,10 @@ Supports:
     inventorySealed when package isolation fields present, embeddedRuntimeDefault
     is false, failClosed ok, and checks reject unknown/appended/fallback.
     EffectiveDone stays false.
+  - WP-12D device e2-e3 (schemaVersion wp12d-device-e2e3/v1):
+    inventorySealed when checks complete and deviceEvidenceClaimed is explicit
+    (bool). EffectiveDone stays false always from sealer; never forges device
+    evidence or task DONE.
 """
 
 from __future__ import annotations
@@ -54,16 +58,33 @@ REQUIRED_ADAPTER_INVENTORY = (
     "failClosed",
     "checks",
 )
+# Minimum keys for device e2-e3 inventories (WP-12D).
+REQUIRED_DEVICE_INVENTORY = (
+    "schemaVersion",
+    "packageName",
+    "deviceEvidenceClaimed",
+    "failClosed",
+    "checks",
+)
 NATIVE_SCHEMA_PREFIX = "wp12b-native"
 ADAPTER_SCHEMA_VERSION = "wp12c-adapter-contract/v1"
 ADAPTER_SCHEMA_PREFIX = "wp12c-adapter-contract"
+DEVICE_SCHEMA_VERSION = "wp12d-device-e2e3/v1"
+DEVICE_SCHEMA_PREFIX = "wp12d-device-e2e3"
 NATIVE_MODES = frozenset({"native-closure", "native-jni"})
 ADAPTER_MODES = frozenset({"adapter-contract", "embedded-adapter"})
+DEVICE_MODES = frozenset({"device-e2e3", "e2-e3"})
 REQUIRED_ADAPTER_CHECKS = (
     "unknownMethodRejected",
     "appendedArgsRejected",
     "fallbackMasqueradeRejected",
     "defaultUsesOfficial",
+)
+REQUIRED_DEVICE_CHECKS = (
+    "missingSerialRejected",
+    "wrongUserRejected",
+    "officialAsEmbeddedHostRejected",
+    "offlineFailClosed",
 )
 # Official WE client class used by WP-12 inventory runs.
 OFFICIAL_APK_SHA256 = "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0"
@@ -114,6 +135,14 @@ def is_adapter_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
         return True
     schema_v = inventory.get("schemaVersion")
     return isinstance(schema_v, str) and schema_v.startswith(ADAPTER_SCHEMA_PREFIX)
+
+
+def is_device_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
+    """Detect WP-12D device e2-e3 from raw.mode or inventory.schemaVersion."""
+    if isinstance(mode, str) and mode in DEVICE_MODES:
+        return True
+    schema_v = inventory.get("schemaVersion")
+    return isinstance(schema_v, str) and schema_v.startswith(DEVICE_SCHEMA_PREFIX)
 
 
 def arm64_lib_count(inventory: dict[str, Any]) -> int:
@@ -340,12 +369,127 @@ def validate_adapter_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
 
 
 
+def resolve_device_evidence_claimed(inventory: dict[str, Any]) -> bool | None:
+    """Return explicit device evidence claim, or None if omitted.
+
+    Accepts seal-facing deviceEvidenceClaimed or harness deviceE3Claim.
+    """
+    if "deviceEvidenceClaimed" in inventory:
+        claimed = inventory.get("deviceEvidenceClaimed")
+        return claimed if isinstance(claimed, bool) else None
+    if "deviceE3Claim" in inventory:
+        claimed = inventory.get("deviceE3Claim")
+        return claimed if isinstance(claimed, bool) else None
+    return None
+
+
+def resolve_device_package_name(inventory: dict[str, Any]) -> str | None:
+    package_name = inventory.get("packageName")
+    if isinstance(package_name, str) and package_name.strip():
+        return package_name.strip()
+    ids = inventory.get("packageIdentities")
+    if isinstance(ids, dict):
+        plugin_pkg = ids.get("plugin")
+        if isinstance(plugin_pkg, str) and plugin_pkg.strip():
+            return plugin_pkg.strip()
+    return None
+
+
+def device_checks_complete(inventory: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Return (ok, errors) for WP-12D checks-complete criteria.
+
+    Prefer an explicit checks object (all required keys true). Otherwise, for
+    harness offline inventories, derive completeness from fail-closed structural
+    fields without inventing device evidence claims.
+    """
+    errors: list[str] = []
+    checks = inventory.get("checks")
+    if isinstance(checks, dict):
+        for key in REQUIRED_DEVICE_CHECKS:
+            if key not in checks:
+                errors.append(f"checks.{key} missing")
+            elif checks.get(key) is not True:
+                errors.append(f"checks.{key} must be true")
+        return (len(errors) == 0, errors)
+
+    # Harness structural path (no checks object): require isolation + dry-run
+    # offline contract fields and failClosed present. Never treat device claim
+    # as complete evidence by itself.
+    if inventory.get("officialNotEmbeddedHost") is not True:
+        errors.append("officialNotEmbeddedHost must be true when checks omitted")
+    ids = inventory.get("packageIdentities")
+    if not isinstance(ids, dict):
+        errors.append("packageIdentities must be object when checks omitted")
+    else:
+        for key in ("plugin", "officialWe"):
+            val = ids.get(key)
+            if not isinstance(val, str) or not val.strip():
+                errors.append(f"packageIdentities.{key} missing")
+        plugin = ids.get("plugin") if isinstance(ids, dict) else None
+        official = ids.get("officialWe") if isinstance(ids, dict) else None
+        if (
+            isinstance(plugin, str)
+            and isinstance(official, str)
+            and plugin.strip()
+            and official.strip()
+            and plugin.strip() == official.strip()
+        ):
+            errors.append("packageIdentities.plugin must differ from officialWe")
+    fail_closed = inventory.get("failClosed")
+    if not isinstance(fail_closed, dict):
+        errors.append("failClosed must be object")
+    # Offline / dry-run harness inventories must not claim live device E3.
+    claimed = resolve_device_evidence_claimed(inventory)
+    if inventory.get("contractDryRun") is True and claimed is True:
+        errors.append("contract dry-run must not claim device evidence")
+    if not errors and claimed is None:
+        errors.append("deviceEvidenceClaimed/deviceE3Claim must be explicit for checks")
+    return (len(errors) == 0, errors)
+
+
+def validate_device_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
+    """Return shape errors for WP-12D device e2-e3 inventory fields."""
+    errors: list[str] = []
+
+    schema_v = inventory.get("schemaVersion")
+    if not isinstance(schema_v, str) or not schema_v.startswith(DEVICE_SCHEMA_PREFIX):
+        errors.append(
+            f"schemaVersion must start with {DEVICE_SCHEMA_PREFIX!r}, got {schema_v!r}"
+        )
+    elif schema_v != DEVICE_SCHEMA_VERSION:
+        errors.append(
+            f"schemaVersion must be {DEVICE_SCHEMA_VERSION!r}, got {schema_v!r}"
+        )
+
+    package_name = resolve_device_package_name(inventory)
+    if not package_name:
+        errors.append("packageName must be non-empty string (or packageIdentities.plugin)")
+
+    # deviceEvidenceClaimed (or harness deviceE3Claim) must be explicit bool.
+    if resolve_device_evidence_claimed(inventory) is None:
+        if "deviceEvidenceClaimed" in inventory or "deviceE3Claim" in inventory:
+            errors.append("deviceEvidenceClaimed/deviceE3Claim must be bool")
+        else:
+            errors.append("deviceEvidenceClaimed must be explicit (bool)")
+
+    fail_closed = inventory.get("failClosed")
+    if not isinstance(fail_closed, dict):
+        errors.append("failClosed must be object")
+
+    checks_ok, check_errors = device_checks_complete(inventory)
+    if not checks_ok:
+        errors.extend(check_errors)
+
+    return errors
+
+
 def inventory_is_complete(
     inventory: dict[str, Any],
     *,
     is_stub: bool,
     native: bool,
     adapter: bool,
+    device: bool = False,
     require_official_sha: bool,
     expected_official_sha: str,
     apk_sha: str | None,
@@ -353,6 +497,18 @@ def inventory_is_complete(
     """inventorySealed criteria. EffectiveDone is never derived here."""
     if is_stub:
         return False
+    if device:
+        if validate_device_inventory_shapes(inventory):
+            return False
+        if not fail_closed_is_ok(inventory.get("failClosed")):
+            return False
+        # inventorySealed only when checks complete and claim explicit.
+        if resolve_device_evidence_claimed(inventory) is None:
+            return False
+        checks_ok, _ = device_checks_complete(inventory)
+        if not checks_ok:
+            return False
+        return True
     if adapter:
         missing = [k for k in REQUIRED_ADAPTER_INVENTORY if k not in inventory]
         if missing:
@@ -390,8 +546,43 @@ def slice_inventory_for_seal(
     *,
     native: bool,
     adapter: bool,
+    device: bool = False,
 ) -> dict[str, Any]:
     """Preserve inventory shapes for sealed blob (no APK/SO bytes)."""
+    if device:
+        checks_in = inventory.get("checks") if isinstance(inventory.get("checks"), dict) else {}
+        claimed = resolve_device_evidence_claimed(inventory)
+        package_name = resolve_device_package_name(inventory)
+        # When checks object present, pin required keys; else mark derived complete.
+        if isinstance(checks_in, dict) and checks_in:
+            checks_out = {
+                key: bool(checks_in.get(key) is True) for key in REQUIRED_DEVICE_CHECKS
+            }
+        else:
+            checks_out = {key: True for key in REQUIRED_DEVICE_CHECKS}
+        sliced_device: dict[str, Any] = {
+            "schemaVersion": inventory.get("schemaVersion"),
+            "packageName": package_name,
+            "deviceEvidenceClaimed": claimed if isinstance(claimed, bool) else False,
+            "failClosed": inventory.get("failClosed")
+            if isinstance(inventory.get("failClosed"), dict)
+            else {"ok": False, "failures": []},
+            "checks": checks_out,
+        }
+        if inventory.get("serial") is not None:
+            sliced_device["serial"] = inventory.get("serial")
+        if isinstance(inventory.get("harness"), dict):
+            sliced_device["harness"] = dict(inventory.get("harness") or {})
+        if isinstance(inventory.get("offline"), bool):
+            sliced_device["offline"] = inventory.get("offline")
+        if isinstance(inventory.get("contractDryRun"), bool):
+            sliced_device["contractDryRun"] = inventory.get("contractDryRun")
+        if isinstance(inventory.get("deviceOnline"), bool):
+            sliced_device["deviceOnline"] = inventory.get("deviceOnline")
+        if isinstance(inventory.get("packageIdentities"), dict):
+            sliced_device["packageIdentities"] = dict(inventory.get("packageIdentities") or {})
+        return sliced_device
+
     if adapter:
         checks_in = inventory.get("checks") if isinstance(inventory.get("checks"), dict) else {}
         sliced_adapter: dict[str, Any] = {
@@ -544,13 +735,46 @@ def main(argv: list[str]) -> int:
     if not isinstance(inventory, dict):
         emit_failure("MISSING_INPUT", "raw.inventory missing or not object")
 
-    adapter = is_adapter_mode(raw.get("mode"), inventory)
-    native = is_native_mode(raw.get("mode"), inventory) and not adapter
+    device = is_device_mode(raw.get("mode"), inventory)
+    adapter = is_adapter_mode(raw.get("mode"), inventory) and not device
+    native = is_native_mode(raw.get("mode"), inventory) and not adapter and not device
     if adapter and is_native_mode(raw.get("mode"), inventory):
         # Mode wins over schema ambiguity; adapter modes take precedence.
         native = False
 
-    if adapter:
+    if device:
+        # Normalize claim/package aliases before required-key checks.
+        if "deviceEvidenceClaimed" not in inventory and "deviceE3Claim" in inventory:
+            claim = inventory.get("deviceE3Claim")
+            if isinstance(claim, bool):
+                inventory = dict(inventory)
+                inventory["deviceEvidenceClaimed"] = claim
+        if not inventory.get("packageName"):
+            pkg = resolve_device_package_name(inventory)
+            if pkg:
+                inventory = dict(inventory)
+                inventory["packageName"] = pkg
+        missing_keys = []
+        for key in REQUIRED_DEVICE_INVENTORY:
+            if key == "deviceEvidenceClaimed":
+                if resolve_device_evidence_claimed(inventory) is None:
+                    missing_keys.append(key)
+            elif key == "packageName":
+                if not resolve_device_package_name(inventory):
+                    missing_keys.append(key)
+            elif key == "checks":
+                # checks object optional when harness structural fields complete
+                checks_ok, _ = device_checks_complete(inventory)
+                if not checks_ok and "checks" not in inventory:
+                    missing_keys.append(key)
+            elif key not in inventory:
+                missing_keys.append(key)
+        if missing_keys:
+            emit_failure(
+                "INVENTORY_INCOMPLETE",
+                f"device e2-e3 inventory missing keys: {','.join(missing_keys)}",
+            )
+    elif adapter:
         missing_keys = [k for k in REQUIRED_ADAPTER_INVENTORY if k not in inventory]
         if missing_keys:
             emit_failure(
@@ -580,7 +804,9 @@ def main(argv: list[str]) -> int:
         )
 
     if not is_stub:
-        if adapter:
+        if device:
+            shape_errors = validate_device_inventory_shapes(inventory)
+        elif adapter:
             shape_errors = validate_adapter_inventory_shapes(inventory)
         elif native:
             shape_errors = validate_native_inventory_shapes(inventory)
@@ -601,8 +827,8 @@ def main(argv: list[str]) -> int:
         )
 
     apk_sha = resolve_apk_sha(raw, inventory)
-    # Adapter-contract has no official APK sha requirement.
-    if args.require_official_sha and not adapter:
+    # Adapter-contract / device e2-e3 have no official APK sha requirement.
+    if args.require_official_sha and not adapter and not device:
         expected = (args.official_sha or OFFICIAL_APK_SHA256).lower()
         if apk_sha:
             if apk_sha.lower() != expected:
@@ -621,14 +847,17 @@ def main(argv: list[str]) -> int:
         is_stub=is_stub,
         native=native,
         adapter=adapter,
-        require_official_sha=bool(args.require_official_sha) and not adapter,
+        device=device,
+        require_official_sha=bool(args.require_official_sha) and not adapter and not device,
         expected_official_sha=args.official_sha or OFFICIAL_APK_SHA256,
         apk_sha=apk_sha,
     )
     # Task EffectiveDone is verify-done only — never claimed from inventory seal.
     effective_done = False
 
-    if adapter:
+    if device:
+        default_task = "WP-12D"
+    elif adapter:
         default_task = "WP-12C"
     elif native:
         default_task = "WP-12B"
@@ -644,7 +873,9 @@ def main(argv: list[str]) -> int:
         "attemptNo": raw["attemptNo"],
         "sealedAt": utc_now_iso(),
         "pluginCommitSha": raw.get("pluginCommitSha"),
-        "inventory": slice_inventory_for_seal(inventory, native=native, adapter=adapter),
+        "inventory": slice_inventory_for_seal(
+            inventory, native=native, adapter=adapter, device=device
+        ),
         "hashes": {
             "rawSha256": sha256_bytes(raw_bytes),
         },
@@ -656,6 +887,11 @@ def main(argv: list[str]) -> int:
             "EffectiveDone is always false here; task EffectiveDone is verify-done only.",
         ],
     }
+    if device:
+        sealed["notes"].append(
+            "device e2-e3 seal: checks complete + deviceEvidenceClaimed explicit; "
+            "EffectiveDone stays false; never forges device evidence."
+        )
     if adapter:
         sealed["notes"].append(
             "adapter-contract seal: package isolation + embeddedRuntimeDefault=false + "
@@ -705,6 +941,7 @@ def main(argv: list[str]) -> int:
         officialApkSha256=apk_sha,
         native=native,
         adapter=adapter,
+        device=device,
     )
 
 

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "wp12d-device-e2e3/v1",
+  "packageName": "com.motif.wallpaperengine",
+  "deviceEvidenceClaimed": false,
+  "offline": true,
+  "failClosed": {
+    "ok": true,
+    "failures": []
+  },
+  "checks": {
+    "missingSerialRejected": true,
+    "wrongUserRejected": true,
+    "officialAsEmbeddedHostRejected": true,
+    "offlineFailClosed": true
+  },
+  "harness": {
+    "case": "device-positive-offline",
+    "note": "offline contract fixture only; never forges live device evidence"
+  }
+}

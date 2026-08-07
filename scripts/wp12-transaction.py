@@ -164,14 +164,34 @@ DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
         "REFACTOR": ["true"],
         "VERIFY": ["bash", "scripts/tests/test-embedded-adapter.sh"],
     },
+    "WP-12D": {
+        "RED": [
+            "bash",
+            "scripts/verify-embedded-runtime-device.sh",
+            "--case",
+            "device-negative",
+        ],
+        "GREEN": [
+            "bash",
+            "scripts/verify-embedded-runtime-device.sh",
+            "--case",
+            "device-positive-offline",
+        ],
+        "REFACTOR": ["true"],
+        "VERIFY": ["bash", "scripts/tests/test-embedded-runtime-device.sh"],
+    },
 }
 
 # RED expected stderr token / failureSignature (primary catalog RED per task).
-DEFAULT_RED_SIGNATURE: dict[str, str] = {
+# Values may be a single token or an ordered tuple of acceptable tokens
+# (first entry is primary; any match satisfies RED policy).
+DEFAULT_RED_SIGNATURE: dict[str, str | tuple[str, ...]] = {
     "WP-12A": "MISSING_DEX",
     "WP-12B": "MISSING_NEEDED",
     # WP-12C primary RED among UNKNOWN_METHOD / CALLER_APPENDED_ARGS / FALLBACK_MASQUERADE
     "WP-12C": "UNKNOWN_METHOD",
+    # WP-12D harness primary negatives: DEVICE_OFFLINE or MISSING_SERIAL
+    "WP-12D": ("DEVICE_OFFLINE", "MISSING_SERIAL"),
 }
 
 # Plugin-leg allowlist paths that must exist at a recorded commit/tree (repo-relative).
@@ -212,6 +232,15 @@ PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
         "scripts/verify-embedded-adapter.sh",
         "scripts/tests/test-embedded-adapter.sh",
     ),
+    # WP-12D: catalog exactFiles (device E2/E3 runtime harness + fixtures).
+    "WP-12D": (
+        "scripts/verify-embedded-runtime-device.sh",
+        "scripts/tests/test-embedded-runtime-device.sh",
+        "scripts/tests/fixtures/device-missing-serial.json",
+        "scripts/tests/fixtures/device-wrong-user.json",
+        "scripts/tests/fixtures/device-official-as-embedded-host.json",
+        "app/src/test/java/com/motif/wallpaperengine/plugin/EmbeddedRuntimeDeviceContractTest.kt",
+    ),
 }
 
 # Commit subject allowlist for commit-plugin (prefix match, case-sensitive).
@@ -219,6 +248,7 @@ PLUGIN_COMMIT_SUBJECT_PREFIXES: tuple[str, ...] = (
     "feat(wp12a)",
     "feat(wp12b)",
     "feat(wp12c)",
+    "feat(wp12d)",
     "feat(wp12)",
     "Merge pull request",  # already-merged PR tips (e.g. #8/#9/#12/#14)
 )
@@ -429,8 +459,17 @@ def phase_argv_for(task_id: str, phase: str) -> list[str]:
     return list(task_map[phase])
 
 
+def red_signatures_for(task_id: str) -> tuple[str, ...]:
+    """Acceptable RED failureSignature tokens for task (primary first)."""
+    raw = DEFAULT_RED_SIGNATURE.get(task_id, "MISSING_DEX")
+    if isinstance(raw, str):
+        return (raw,)
+    return tuple(raw)
+
+
 def red_signature_for(task_id: str) -> str:
-    return DEFAULT_RED_SIGNATURE.get(task_id, "MISSING_DEX")
+    """Primary (first) RED failureSignature token for task."""
+    return red_signatures_for(task_id)[0]
 
 
 def ensure_not_declare_done(args: argparse.Namespace) -> None:
@@ -481,24 +520,26 @@ def validate_phase_prereq(receipt: dict[str, Any], phase: str) -> None:
 def extract_failure_signature(stderr: str, phase: str, task_id: str) -> str | None:
     if phase != "RED":
         return None
-    token = red_signature_for(task_id)
-    # Match bare token as whole word / line (stderr prints MISSING_DEX alone).
-    for line in stderr.splitlines():
-        if line.strip() == token or token in line.split():
+    # Prefer primary token when multiple acceptable signatures exist.
+    for token in red_signatures_for(task_id):
+        # Match bare token as whole word / line (stderr prints MISSING_DEX alone).
+        for line in stderr.splitlines():
+            if line.strip() == token or token in line.split():
+                return token
+        if token in stderr:
             return token
-    if token in stderr:
-        return token
     return None
 
 
 def policy_ok(phase: str, exit_code: int, failure_signature: str | None, task_id: str) -> tuple[bool, str]:
     """Return (ok, reason) for complete-phase expectedExit policy."""
     if phase == "RED":
-        expected_sig = red_signature_for(task_id)
+        expected_sigs = red_signatures_for(task_id)
         if exit_code == 0:
             return False, "RED_EXPECTED_NONZERO"
-        if failure_signature != expected_sig:
-            return False, f"RED_SIGNATURE_MISMATCH want={expected_sig} got={failure_signature}"
+        if failure_signature not in expected_sigs:
+            want = "|".join(expected_sigs)
+            return False, f"RED_SIGNATURE_MISMATCH want={want} got={failure_signature}"
         return True, "ok"
     # GREEN / REFACTOR / VERIFY
     if exit_code != 0:

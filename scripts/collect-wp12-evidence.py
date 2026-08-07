@@ -13,16 +13,23 @@ Usage:
   collect-wp12-evidence.py --mode adapter-contract --out PATH \\
       [--inventory PATH] --transaction PATH --attempt-no N
 
+  collect-wp12-evidence.py --mode e2-e3 --out PATH \\
+      (--inventory PATH | --offline-fixture PATH) \\
+      [--serial SERIAL] --transaction PATH --attempt-no N
+
 Modes:
   runtime-inventory  — WP-12A manifest map (prebuilt inventory or APK stub)
   native-closure     — WP-12B native/JNI closure (alias: native-jni)
   native-jni         — alias of native-closure
   adapter-contract   — WP-12C embedded adapter contract (alias: embedded-adapter)
   embedded-adapter   — alias of adapter-contract
+  e2-e3              — WP-12D device E2/E3 (alias: device-e2e3)
+  device-e2e3        — alias of e2-e3
 
 Writes a raw (unsealed) inventory JSON only when required inputs exist.
 Never stages official APK bytes into Git-tracked paths.
 Never forges EffectiveDone.
+Never forges device evidence (deviceEvidenceClaimed stays as provided; never invented true).
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ from typing import Any, NoReturn
 EXIT_FAIL = 2
 SCHEMA = "wp12-evidence-raw/v1"
 ADAPTER_CONTRACT_SCHEMA = "wp12c-adapter-contract/v1"
+DEVICE_E2E3_SCHEMA = "wp12d-device-e2e3/v1"
 DEFAULT_PACKAGE_NAME = "com.motif.wallpaperengine"
 DEFAULT_OFFICIAL_ENGINE_PACKAGE = "io.wallpaperengine.weclient"
 MODES = frozenset(
@@ -50,13 +58,17 @@ MODES = frozenset(
         "native-closure",  # alias of native-jni (WP-12B)
         "adapter-contract",  # WP-12C embedded adapter contract
         "embedded-adapter",  # alias of adapter-contract
-        "device-e2e3",
+        "e2-e3",  # WP-12D device E2/E3 (canonical)
+        "device-e2e3",  # alias of e2-e3
         "scene-video-e4",
     }
 )
 NATIVE_MODES = frozenset({"native-jni", "native-closure"})
 ADAPTER_MODES = frozenset({"adapter-contract", "embedded-adapter"})
-IMPLEMENTED_MODES = frozenset({"runtime-inventory"}) | NATIVE_MODES | ADAPTER_MODES
+DEVICE_MODES = frozenset({"e2-e3", "device-e2e3"})
+IMPLEMENTED_MODES = (
+    frozenset({"runtime-inventory"}) | NATIVE_MODES | ADAPTER_MODES | DEVICE_MODES
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPT_DIR.parent
@@ -401,6 +413,129 @@ def collect_adapter_contract(args: argparse.Namespace, txn: dict[str, Any], out:
     )
 
 
+def adb_device_state(serial: str) -> str | None:
+    """Return adb get-state output (e.g. 'device') or None if adb fails."""
+    if not serial or not str(serial).strip():
+        return None
+    try:
+        proc = subprocess.run(
+            ["adb", "-s", str(serial).strip(), "get-state"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    state = (proc.stdout or "").strip()
+    return state or None
+
+
+def collect_device_e2e3(args: argparse.Namespace, txn: dict[str, Any], out: Path) -> int:
+    """WP-12D: device E2/E3 collect from --inventory or --offline-fixture.
+
+    Fail-closed:
+      - requires --inventory OR --offline-fixture (never synthesizes device evidence)
+      - if --serial given and device offline → DEVICE_OFFLINE
+      - never forges deviceEvidenceClaimed=true
+      - raw always EffectiveDone=false
+    """
+    evidence_mode = "device-e2e3" if args.mode in DEVICE_MODES else args.mode
+    serial = getattr(args, "serial", None)
+    if isinstance(serial, str):
+        serial = serial.strip() or None
+    else:
+        serial = None
+
+    if serial is not None:
+        state = adb_device_state(serial)
+        if state != "device":
+            emit_failure(
+                "DEVICE_OFFLINE",
+                f"serial={serial!r} adb state={state!r} (fail-closed; never forge device evidence)",
+            )
+
+    inv_path: Path | None = None
+    inventory_source: str | None = None
+    if args.inventory:
+        inv_path = Path(args.inventory)
+        inventory_source = str(inv_path.resolve())
+    elif getattr(args, "offline_fixture", None):
+        inv_path = Path(args.offline_fixture)
+        inventory_source = f"offline-fixture:{inv_path.resolve()}"
+    else:
+        emit_failure(
+            "MISSING_INPUT",
+            "e2-e3/device-e2e3 needs --inventory or --offline-fixture "
+            "(fail-closed; never forge device evidence)",
+        )
+
+    assert inv_path is not None
+    inventory = dict(load_inventory_file(inv_path))
+    schema_v = inventory.get("schemaVersion")
+    if schema_v is not None and schema_v != DEVICE_E2E3_SCHEMA:
+        emit_failure(
+            "ILLEGAL_STATE",
+            f"device e2-e3 inventory schemaVersion must be "
+            f"{DEVICE_E2E3_SCHEMA}, got {schema_v!r}",
+        )
+
+    # Normalize harness inventory (deviceE3Claim / packageIdentities) into the
+    # seal-facing deviceEvidenceClaimed + packageName fields. Never invent true.
+    if "deviceEvidenceClaimed" not in inventory and "deviceE3Claim" in inventory:
+        claim = inventory.get("deviceE3Claim")
+        if isinstance(claim, bool):
+            inventory["deviceEvidenceClaimed"] = claim
+    if not inventory.get("packageName"):
+        ids = inventory.get("packageIdentities")
+        if isinstance(ids, dict):
+            plugin_pkg = ids.get("plugin")
+            if isinstance(plugin_pkg, str) and plugin_pkg.strip():
+                inventory["packageName"] = plugin_pkg.strip()
+    if inventory.get("packageName") is None:
+        inventory["packageName"] = DEFAULT_PACKAGE_NAME
+
+    # Never forge device evidence: if inventory claims device evidence without
+    # an online serial, refuse rather than rewrite or invent.
+    claimed = inventory.get("deviceEvidenceClaimed")
+    if claimed is True and serial is None:
+        emit_failure(
+            "DEVICE_EVIDENCE_FORGED",
+            "deviceEvidenceClaimed=true requires --serial with online device "
+            "(fail-closed; never forge device evidence)",
+        )
+    # If inventory omits deviceEvidenceClaimed, leave it omitted — sealer
+    # requires explicit bool for inventorySealed. Collect does not invent true.
+
+    if serial is not None:
+        # Record observed serial; do not invent claim flags as true.
+        inventory["serial"] = serial
+        if "deviceEvidenceClaimed" not in inventory:
+            # Online serial alone does not constitute sealed device evidence.
+            inventory["deviceEvidenceClaimed"] = False
+
+    write_raw_evidence(
+        out,
+        mode=evidence_mode,
+        txn=txn,
+        attempt_no=args.attempt_no,
+        apk_sha=None,
+        inventory_source=inventory_source,
+        inventory=inventory,
+    )
+    return emit_ok(
+        "collect",
+        mode=evidence_mode,
+        out=str(out),
+        attemptNo=args.attempt_no,
+        sealed=False,
+        EffectiveDone=False,
+        inventorySource=inventory_source,
+        deviceEvidenceClaimed=inventory.get("deviceEvidenceClaimed"),
+        serial=serial,
+    )
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="collect-wp12-evidence.py")
     parser.add_argument("--mode", required=True)
@@ -410,7 +545,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--attempt-no", type=int)
     parser.add_argument(
         "--inventory",
-        help="prebuilt inventory (runtime / native / adapter-contract JSON)",
+        help="prebuilt inventory (runtime / native / adapter-contract / device-e2e3 JSON)",
+    )
+    parser.add_argument(
+        "--offline-fixture",
+        help="WP-12D offline device contract fixture path (no live device evidence)",
+    )
+    parser.add_argument(
+        "--serial",
+        help="optional adb serial for WP-12D; offline → DEVICE_OFFLINE (fail-closed)",
     )
     args = parser.parse_args(argv)
 
@@ -421,7 +564,8 @@ def main(argv: list[str]) -> int:
         emit_failure(
             "MODE_NOT_IMPLEMENTED",
             "scaffold implements runtime-inventory, native-closure/native-jni, "
-            f"and adapter-contract/embedded-adapter; got {args.mode}",
+            "adapter-contract/embedded-adapter, and e2-e3/device-e2e3; "
+            f"got {args.mode}",
         )
 
     # Fail-closed: transaction + attempt required for real collect path.
@@ -451,6 +595,8 @@ def main(argv: list[str]) -> int:
         return collect_native_closure(args, txn, out)
     if args.mode in ADAPTER_MODES:
         return collect_adapter_contract(args, txn, out)
+    if args.mode in DEVICE_MODES:
+        return collect_device_e2e3(args, txn, out)
 
     emit_failure("MODE_NOT_IMPLEMENTED", f"unhandled mode: {args.mode}")
 
