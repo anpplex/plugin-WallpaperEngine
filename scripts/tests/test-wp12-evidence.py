@@ -1914,6 +1914,341 @@ class TestWp12cPhaseAndCollect(unittest.TestCase):
             self.assertFalse(raw_out.exists())
 
 
+class TestWp12dPhaseAndCollect(unittest.TestCase):
+    """WP-12D experimental: phase fences + device e2-e3 collect/seal.
+
+    RED harness (scripts/verify-embedded-runtime-device.sh) may land in a
+    parallel PR; when missing, RED signature tests skip with a clear message.
+    Fail-closed: never forges EffectiveDone or device evidence.
+    """
+
+    VERIFY_DEVICE = PLUGIN_ROOT / "scripts" / "verify-embedded-runtime-device.sh"
+    PASS_FIXTURE = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "device-positive-offline.json"
+    )
+    HARNESS_OFFLINE_PASS = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "device-e2e3-pass-offline.json"
+    )
+    NEG_FIXTURE = (
+        PLUGIN_ROOT / "scripts" / "tests" / "fixtures" / "device-fail-closed.json"
+    )
+    ACCEPTABLE_RED_SIGS = frozenset({"DEVICE_OFFLINE", "MISSING_SERIAL"})
+
+    def _init_local_wp12d(self, tmp: str) -> Path:
+        proc = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12D",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        self.assertEqual(parse_json_stdout(proc).get("state"), "TREE_FROZEN")
+        txn = Path(tmp) / "wp-12d.json"
+        self.assertTrue(txn.is_file(), f"expected transaction file {txn}")
+        return txn
+
+    def test_wp12d_init_writes_wp12d_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn = self._init_local_wp12d(tmp)
+            receipt = json.loads(txn.read_text(encoding="utf-8"))
+            self.assertEqual(receipt.get("taskId"), "WP-12D")
+            self.assertEqual(receipt.get("state"), "TREE_FROZEN")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+    def test_wp12d_record_red_when_harness_present(self) -> None:
+        """record-phase RED for WP-12D → RED_RECORDED with DEVICE_OFFLINE|MISSING_SERIAL.
+
+        Skips when scripts/verify-embedded-runtime-device.sh is not landed yet.
+        """
+        if not self.VERIFY_DEVICE.is_file():
+            self.skipTest(
+                "WP-12D RED harness missing: scripts/verify-embedded-runtime-device.sh "
+                "(land device harness before RED signature pin; primary tokens "
+                "DEVICE_OFFLINE or MISSING_SERIAL)"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local_wp12d(tmp)
+            red = run_py(
+                TXN_PY,
+                "record-phase",
+                "--task",
+                "WP-12D",
+                "--phase",
+                "RED",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(red.returncode, 0, msg=red.stdout + red.stderr)
+            payload = parse_json_stdout(red)
+            self.assertEqual(payload.get("state"), "RED_RECORDED")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+            receipt = json.loads((Path(tmp) / "wp-12d.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "RED_RECORDED")
+            self.assertEqual(len(receipt.get("phaseEvents") or []), 1)
+            event = receipt["phaseEvents"][0]
+            self.assertEqual(event["phase"], "RED")
+            self.assertNotEqual(event["exitCode"], 0)
+            self.assertIn(event["failureSignature"], self.ACCEPTABLE_RED_SIGS)
+            self.assertEqual(event["stateAfter"], "RED_RECORDED")
+            self.assertIn("stderrSha256", event)
+            self.assertIn("argv", event)
+            argv = event["argv"]
+            self.assertIn("scripts/verify-embedded-runtime-device.sh", argv)
+            self.assertIn("device-negative", argv)
+
+    def test_wp12d_collect_e2e3_from_offline_fixture(self) -> None:
+        """e2-e3 collect from --offline-fixture writes raw EffectiveDone=false."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--offline-fixture",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            collect_payload = parse_json_stdout(collect)
+            self.assertEqual(collect_payload.get("mode"), "device-e2e3")
+            self.assertFalse(collect_payload.get("EffectiveDone"))
+            self.assertFalse(collect_payload.get("sealed"))
+            self.assertIs(collect_payload.get("deviceEvidenceClaimed"), False)
+
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertEqual(raw.get("mode"), "device-e2e3")
+            self.assertFalse(raw.get("EffectiveDone"))
+            self.assertFalse(raw.get("sealed"))
+            inv = raw["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12d-device-e2e3/v1")
+            self.assertEqual(inv.get("packageName"), "com.motif.wallpaperengine")
+            self.assertIs(inv.get("deviceEvidenceClaimed"), False)
+            self.assertTrue(inv.get("failClosed", {}).get("ok"))
+            checks = inv.get("checks") or {}
+            self.assertTrue(checks.get("missingSerialRejected"))
+            self.assertTrue(checks.get("wrongUserRejected"))
+            self.assertTrue(checks.get("officialAsEmbeddedHostRejected"))
+            self.assertTrue(checks.get("offlineFailClosed"))
+            # Must not require WP-12A/B/C keys.
+            for key in (
+                "manifest",
+                "dex",
+                "resources",
+                "authorities",
+                "permissions",
+                "abis",
+                "embeddedRuntimeDefault",
+            ):
+                self.assertNotIn(key, inv)
+
+    def test_wp12d_collect_device_e2e3_alias_from_inventory(self) -> None:
+        """device-e2e3 alias + --inventory path also works."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "device-e2e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("mode"), "device-e2e3")
+            self.assertFalse(payload.get("EffectiveDone"))
+
+    def test_wp12d_collect_missing_inventory_and_fixture_fails(self) -> None:
+        """Without --inventory/--offline-fixture → MISSING_INPUT (fail-closed)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "MISSING_INPUT")
+            self.assertFalse(raw_out.exists())
+
+    def test_wp12d_collect_serial_offline_device_offline(self) -> None:
+        """--serial with offline adb state → DEVICE_OFFLINE (never forge)."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--offline-fixture",
+                str(self.PASS_FIXTURE),
+                "--serial",
+                "OFFLINE-SERIAL-DOES-NOT-EXIST-wp12d",
+            )
+            self.assertNotEqual(collect.returncode, 0)
+            payload = parse_json_stdout(collect)
+            self.assertEqual(payload.get("failureReason"), "DEVICE_OFFLINE")
+            self.assertFalse(raw_out.exists())
+
+    def test_wp12d_seal_offline_fixture_inventory_sealed_effective_done_false(self) -> None:
+        """offline fixture → inventorySealed=true; EffectiveDone false; claim explicit."""
+        self.assertTrue(self.PASS_FIXTURE.is_file(), f"missing fixture {self.PASS_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--offline-fixture",
+                str(self.PASS_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_payload = parse_json_stdout(seal)
+            self.assertTrue(seal_payload.get("inventorySealed"))
+            self.assertFalse(seal_payload.get("EffectiveDone"))
+            self.assertTrue(seal_payload.get("device"))
+            self.assertFalse(seal_payload.get("adapter"))
+            self.assertFalse(seal_payload.get("native"))
+
+            sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+            self.assertTrue(sealed.get("inventorySealed"))
+            self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertEqual(sealed.get("mode"), "device-e2e3")
+            self.assertEqual(sealed.get("taskId"), "WP-12D")
+            self.assertEqual(
+                sealed.get("inventorySchemaVersion"), "wp12d-device-e2e3/v1"
+            )
+            inv = sealed["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12d-device-e2e3/v1")
+            self.assertIs(inv.get("deviceEvidenceClaimed"), False)
+            self.assertIn("failClosed", inv)
+            self.assertIn("checks", inv)
+            self.assertNotIn("manifest", inv)
+            self.assertNotIn("abis", inv)
+            self.assertTrue(sealed.get("failClosed", {}).get("ok"))
+
+    def test_wp12d_seal_fail_closed_rejected(self) -> None:
+        """failClosed.ok=false → FAIL_CLOSED_NOT_OK; no inventorySealed claim."""
+        self.assertTrue(self.NEG_FIXTURE.is_file(), f"missing fixture {self.NEG_FIXTURE}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--inventory",
+                str(self.NEG_FIXTURE),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertNotEqual(seal.returncode, 0)
+            payload = parse_json_stdout(seal)
+            self.assertEqual(payload.get("failureReason"), "FAIL_CLOSED_NOT_OK")
+            self.assertFalse(sealed_out.exists())
+
+    def test_wp12d_seal_harness_offline_pass_fixture(self) -> None:
+        """Harness device-e2e3-pass-offline → inventorySealed; EffectiveDone false.
+
+        Accepts deviceE3Claim as explicit claim; never forges device evidence.
+        """
+        if not self.HARNESS_OFFLINE_PASS.is_file():
+            self.skipTest(f"harness offline pass fixture missing: {self.HARNESS_OFFLINE_PASS}")
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local_wp12d(tmp)
+            raw_out = Path(tmp) / "raw.json"
+            collect = run_py(
+                COLLECT_PY,
+                "--mode",
+                "e2-e3",
+                "--out",
+                str(raw_out),
+                "--transaction",
+                str(txn_path),
+                "--attempt-no",
+                "1",
+                "--offline-fixture",
+                str(self.HARNESS_OFFLINE_PASS),
+            )
+            self.assertEqual(collect.returncode, 0, msg=collect.stdout + collect.stderr)
+            raw = json.loads(raw_out.read_text(encoding="utf-8"))
+            self.assertFalse(raw.get("EffectiveDone"))
+            # collect normalizes deviceE3Claim → deviceEvidenceClaimed
+            self.assertIs(raw["inventory"].get("deviceEvidenceClaimed"), False)
+
+            sealed_out = Path(tmp) / "sealed.json"
+            seal = run_py(SEAL_PY, "--raw", str(raw_out), "--out", str(sealed_out))
+            self.assertEqual(seal.returncode, 0, msg=seal.stdout + seal.stderr)
+            seal_payload = parse_json_stdout(seal)
+            self.assertTrue(seal_payload.get("inventorySealed"))
+            self.assertFalse(seal_payload.get("EffectiveDone"))
+            self.assertTrue(seal_payload.get("device"))
+
+            sealed = json.loads(sealed_out.read_text(encoding="utf-8"))
+            self.assertTrue(sealed.get("inventorySealed"))
+            self.assertFalse(sealed.get("EffectiveDone"))
+            self.assertEqual(sealed.get("taskId"), "WP-12D")
+            inv = sealed["inventory"]
+            self.assertEqual(inv.get("schemaVersion"), "wp12d-device-e2e3/v1")
+            self.assertIs(inv.get("deviceEvidenceClaimed"), False)
+
+
 class TestNativeClosureSeal(unittest.TestCase):
     """WP-12B native-closure inventory seal (no WP-12A keys; EffectiveDone false)."""
 

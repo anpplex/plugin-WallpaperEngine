@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "wp12d-device-e2e3/v1",
+  "packageName": "com.motif.wallpaperengine",
+  "deviceEvidenceClaimed": false,
+  "offline": true,
+  "failClosed": {
+    "ok": false,
+    "failures": ["MISSING_SERIAL"]
+  },
+  "checks": {
+    "missingSerialRejected": true,
+    "wrongUserRejected": true,
+    "officialAsEmbeddedHostRejected": true,
+    "offlineFailClosed": true
+  }
+}
