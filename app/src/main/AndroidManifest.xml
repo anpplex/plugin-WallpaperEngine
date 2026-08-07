@@ -63,12 +63,18 @@
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
-        <!-- WP-12C experimental: embedded preview shell (not exported). -->
+        <!-- WP-12E experimental: embedded preview (exported for adb live E4). -->
         <activity
             android:name=".plugin.EmbeddedPreviewActivity"
             android:excludeFromRecents="true"
-            android:exported="false"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+            android:exported="true"
+            android:screenOrientation="unspecified"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            <intent-filter>
+                <action android:name="com.motif.wallpaperengine.action.EMBEDDED_PREVIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".MainActivity"

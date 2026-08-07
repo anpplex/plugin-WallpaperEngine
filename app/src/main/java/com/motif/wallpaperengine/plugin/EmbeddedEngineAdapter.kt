@@ -83,5 +83,17 @@ class EmbeddedEngineAdapter(
          */
         const val EMBEDDED_WALLPAPER_SERVICE =
             "com.motif.wallpaperengine.wallpaper.WeBridgeWallpaperService"
+
+        /**
+         * WP-12E experimental dual-frame capture Activity (not official WE UI).
+         * Launch via [EmbeddedPreviewActivity.buildLaunchIntent] with allowlisted
+         * extras (`sampleKind`, `mpkgSha256`); unknown extras fail-closed.
+         */
+        const val EMBEDDED_PREVIEW_ACTIVITY =
+            "com.motif.wallpaperengine.plugin.EmbeddedPreviewActivity"
+
+        /** Flattened component for adb / harness: package/activity. */
+        const val EMBEDDED_PREVIEW_COMPONENT =
+            "$EMBEDDED_ENGINE_PACKAGE/$EMBEDDED_PREVIEW_ACTIVITY"
     }
 }

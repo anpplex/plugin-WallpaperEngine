@@ -180,6 +180,23 @@ DEFAULT_PHASE_ARGV: dict[str, dict[str, list[str]]] = {
         "REFACTOR": ["true"],
         "VERIFY": ["bash", "scripts/tests/test-embedded-runtime-device.sh"],
     },
+    # WP-12E: catalog frame harness (verify-embedded-scene-video).
+    "WP-12E": {
+        "RED": [
+            "bash",
+            "scripts/verify-embedded-scene-video.sh",
+            "--case",
+            "frame-negative",
+        ],
+        "GREEN": [
+            "bash",
+            "scripts/verify-embedded-scene-video.sh",
+            "--case",
+            "frame-positive-offline",
+        ],
+        "REFACTOR": ["true"],
+        "VERIFY": ["bash", "scripts/tests/test-embedded-scene-video.sh"],
+    },
 }
 
 # RED expected stderr token / failureSignature (primary catalog RED per task).
@@ -192,6 +209,8 @@ DEFAULT_RED_SIGNATURE: dict[str, str | tuple[str, ...]] = {
     "WP-12C": "UNKNOWN_METHOD",
     # WP-12D harness primary negatives: DEVICE_OFFLINE or MISSING_SERIAL
     "WP-12D": ("DEVICE_OFFLINE", "MISSING_SERIAL"),
+    # WP-12E frame harness primary negatives: BLACK_FRAME | SINGLE_SAMPLE | SOLID_COLOR
+    "WP-12E": ("BLACK_FRAME", "SINGLE_SAMPLE", "SOLID_COLOR"),
 }
 
 # Plugin-leg allowlist paths that must exist at a recorded commit/tree (repo-relative).
@@ -241,6 +260,16 @@ PLUGIN_ALLOWLIST: dict[str, tuple[str, ...]] = {
         "scripts/tests/fixtures/device-official-as-embedded-host.json",
         "app/src/test/java/com/motif/wallpaperengine/plugin/EmbeddedRuntimeDeviceContractTest.kt",
     ),
+    # WP-12E: catalog exactFiles (scene/video E4 frame harness + analyzer).
+    "WP-12E": (
+        "scripts/verify-embedded-scene-video.sh",
+        "scripts/tests/test-embedded-scene-video.sh",
+        "scripts/tests/fixtures/frame-black.json",
+        "scripts/tests/fixtures/frame-single-sample.json",
+        "scripts/tests/fixtures/frame-e4-pass-offline.json",
+        "app/src/test/java/com/motif/wallpaperengine/plugin/EmbeddedSceneVideoTest.kt",
+        "scripts/analyze-frame-nonblack.py",
+    ),
 }
 
 # Commit subject allowlist for commit-plugin (prefix match, case-sensitive).
@@ -249,6 +278,7 @@ PLUGIN_COMMIT_SUBJECT_PREFIXES: tuple[str, ...] = (
     "feat(wp12b)",
     "feat(wp12c)",
     "feat(wp12d)",
+    "feat(wp12e)",
     "feat(wp12)",
     "Merge pull request",  # already-merged PR tips (e.g. #8/#9/#12/#14)
 )
