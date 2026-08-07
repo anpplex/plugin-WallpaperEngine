@@ -629,6 +629,139 @@ def resolve_target_user(args: argparse.Namespace) -> int:
         emit_failure("MISSING_INPUT", f"invalid --user: {user!r}")
 
 
+# Avatr/Huawei car HU install bypass (same as scripts/install-car.sh / Lyra).
+HUAWEI_CAR_INSTALLER = "com.huawei.appinstaller.car"
+SYSTEM_PACKAGE_INSTALLER = "com.android.packageinstaller"
+
+
+def install_plugin_lyra_style(
+    *,
+    serial: str,
+    target_user: int,
+    plugin_apk: Path,
+) -> None:
+    """Install plugin via Huawei car installer; never bare `adb install`.
+
+    Bare adb install triggers the system PackageInstaller confirm dialog and
+    fails with INSTALL_FAILED_ABORTED on production HU. Lyra/Motif path:
+    push to /data/local/tmp, disable-user PackageInstaller, pm install -i
+    com.huawei.appinstaller.car, re-enable PackageInstaller.
+    """
+    if not plugin_apk.is_file():
+        raise FileNotFoundError(f"plugin apk not found: {plugin_apk}")
+    remote = "/data/local/tmp/wp12e-plugin.apk"
+
+    def _run(argv: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    try:
+        push = _run(["adb", "-s", serial, "push", str(plugin_apk), remote], timeout=180)
+        if push.returncode != 0:
+            raise RuntimeError(
+                f"adb push failed: {(push.stdout or '') + (push.stderr or '')}"[-400:]
+            )
+        # Disable system PackageInstaller so install does not surface confirm UI.
+        _run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "pm",
+                "disable-user",
+                "--user",
+                str(target_user),
+                SYSTEM_PACKAGE_INSTALLER,
+            ]
+        )
+        _run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "pm",
+                "disable-user",
+                "--user",
+                "0",
+                SYSTEM_PACKAGE_INSTALLER,
+            ]
+        )
+        install = _run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "pm",
+                "install",
+                "-r",
+                "-d",
+                "-g",
+                "-t",
+                "-i",
+                HUAWEI_CAR_INSTALLER,
+                "--user",
+                str(target_user),
+                remote,
+            ],
+            timeout=180,
+        )
+        install_out = ((install.stdout or "") + (install.stderr or "")).replace("\r", "")
+        if install.returncode != 0 or "Success" not in install_out:
+            raise RuntimeError(
+                f"pm install -i {HUAWEI_CAR_INSTALLER} failed: {install_out[-400:]}"
+            )
+        _run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "pm",
+                "enable",
+                "--user",
+                str(target_user),
+                DEFAULT_PACKAGE_NAME,
+            ]
+        )
+    finally:
+        # Always re-enable PackageInstaller (Motif/Lyra trap semantics).
+        _run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "pm",
+                "enable",
+                "--user",
+                str(target_user),
+                SYSTEM_PACKAGE_INSTALLER,
+            ]
+        )
+        _run(
+            [
+                "adb",
+                "-s",
+                serial,
+                "shell",
+                "pm",
+                "enable",
+                "--user",
+                "0",
+                SYSTEM_PACKAGE_INSTALLER,
+            ]
+        )
+        _run(["adb", "-s", serial, "shell", "rm", "-f", remote])
+
+
 def resolve_live_apk_paths(args: argparse.Namespace) -> dict[str, Path]:
     """Resolve local APK paths for live e2-e3; fail-closed MISSING_APK."""
     mapping = {
@@ -965,15 +1098,26 @@ def adb_screencap_png(serial: str, dest: Path) -> None:
 
 
 def run_analyze_frame(*frame_paths: Path) -> dict[str, Any]:
-    """Run analyze-frame-nonblack.py --json --require-dual on frame paths."""
+    """Run analyze-frame-nonblack.py on PNG paths (require dual; JSON via --json-out)."""
     if not ANALYZE_FRAME.is_file():
         emit_failure(
             "MISSING_TOOL",
             f"analyze-frame-nonblack.py not found: {ANALYZE_FRAME}",
         )
-    cmd = [sys.executable, str(ANALYZE_FRAME), "--json", "--require-dual"]
-    for p in frame_paths:
-        cmd.extend(["--frame", str(p)])
+    paths = [Path(p) for p in frame_paths]
+    for p in paths:
+        if not p.is_file():
+            emit_failure("MISSING_FRAME", f"frame missing: {p}")
+    # Write machine JSON to temp sibling of first frame.
+    json_out = paths[0].with_suffix(paths[0].suffix + ".analysis.json")
+    cmd = [
+        sys.executable,
+        str(ANALYZE_FRAME),
+        "--require-dual",
+        "--json-out",
+        str(json_out),
+        *[str(p) for p in paths],
+    ]
     try:
         proc = subprocess.run(
             cmd,
@@ -996,11 +1140,12 @@ def run_analyze_frame(*frame_paths: Path) -> dict[str, Any]:
                 "SINGLE_SAMPLE",
                 "IDENTICAL_FRAME",
                 "UNREADABLE",
+                "MISSING_FRAME",
+                "FRAME_INTERVAL_TOO_SHORT",
             ):
                 token = t
                 break
         if token is None:
-            # Prefer first bare token-looking word.
             for line in stderr.splitlines():
                 parts = line.strip().split()
                 if parts and parts[0].isupper() and "_" in parts[0]:
@@ -1010,15 +1155,29 @@ def run_analyze_frame(*frame_paths: Path) -> dict[str, Any]:
             token or "FRAME_ANALYSIS_FAILED",
             f"analyze-frame exit {proc.returncode}: {(stderr or stdout)[-500:]}",
         )
-    try:
-        payload = json.loads(stdout.splitlines()[-1] if stdout else "{}")
-    except json.JSONDecodeError:
-        emit_failure("ILLEGAL_STATE", f"analyze-frame JSON unreadable: {stdout[-300:]}")
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
+    payload: dict[str, Any] | None = None
+    if json_out.is_file():
+        try:
+            payload = json.loads(json_out.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+    if not isinstance(payload, dict):
+        # Fallback: analyzer status line is status|codes|message, not full JSON.
+        emit_failure(
+            "ILLEGAL_STATE",
+            f"analyze-frame JSON unreadable: {(stdout or stderr)[-300:]}",
+        )
+    # Analyzer result uses ok=true on pass; tolerate status PASS.
+    if payload.get("ok") is not True and str(payload.get("status", "")).upper() not in {
+        "PASS",
+        "OK",
+        "TRUE",
+    }:
         emit_failure(
             "FRAME_ANALYSIS_FAILED",
             f"analyze-frame did not report ok: {payload!r}",
         )
+    payload["ok"] = True
     return payload
 
 
@@ -1240,34 +1399,20 @@ def build_live_scene_video_inventory(
         emit_failure("MISSING_INPUT", f"video mpkg not found: {video_mpkg}")
 
     plugin_pkg = DEFAULT_PACKAGE_NAME
-    # Install/update plugin so EmbeddedPreviewActivity + exported intent are current.
-    try:
-        proc = subprocess.run(
-            [
-                "adb",
-                "-s",
-                serial,
-                "install",
-                "-r",
-                "--user",
-                str(target_user),
-                str(plugin_apk),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        emit_failure("LAUNCH_FAILED", f"adb install failed: {exc}")
-    install_out = ((proc.stdout or "") + (proc.stderr or "")).replace("\r", "")
-    if proc.returncode != 0 or "Success" not in install_out:
-        emit_failure(
-            "LAUNCH_FAILED",
-            f"adb install --user {target_user} failed: {install_out[-400:]}",
-        )
-
+    # Prefer already-installed package. On Avatr/Huawei HU, bare `adb install`
+    # triggers PackageInstaller UI → INSTALL_FAILED_ABORTED. Use Lyra-style
+    # install via com.huawei.appinstaller.car (see scripts/install-car.sh).
     on_device = adb_pm_path(serial, plugin_pkg, target_user)
+    if not on_device:
+        try:
+            install_plugin_lyra_style(
+                serial=serial,
+                target_user=target_user,
+                plugin_apk=plugin_apk,
+            )
+        except Exception as exc:  # noqa: BLE001 — map to fail-closed LAUNCH_FAILED
+            emit_failure("LAUNCH_FAILED", f"lyra-style install failed: {exc}")
+        on_device = adb_pm_path(serial, plugin_pkg, target_user)
     if not on_device:
         emit_failure(
             "MISSING_APK",
