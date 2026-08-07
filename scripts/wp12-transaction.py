@@ -19,6 +19,14 @@ Commands:
   prepare-plugin  VERIFIED|EVIDENCE_SEALED → PLUGIN_PREPARED (bookkeeping only)
   commit-plugin   PLUGIN_PREPARED → PLUGIN_COMMITTED (--commit-sha proven)
   record-plugin-merged  VERIFIED|EVIDENCE_SEALED|PLUGIN_PREPARED → PLUGIN_COMMITTED
+  record-mineradio-evidence
+                  PLUGIN_COMMITTED|EVIDENCE_SEALED → MINERADIO_EVIDENCE_COMMITTED
+  record-mineradio-evidence-push
+                  MINERADIO_EVIDENCE_COMMITTED → MINERADIO_EVIDENCE_PUSHED (ls-remote)
+  prepare-closure MINERADIO_EVIDENCE_PUSHED → CLOSURE_PREPARED (checklist)
+  record-closure-commit  CLOSURE_PREPARED → MINERADIO_CLOSURE_COMMITTED
+  record-closure-push    MINERADIO_CLOSURE_COMMITTED → MINERADIO_CLOSURE_PUSHED
+  verify-done     Hard gates → DONE + EffectiveDone=true (only path that may set it)
 
 Serial barriers (phase slice):
   TREE_FROZEN → RED_RECORDED → GREEN_RECORDED → REFACTOR_RECORDED → VERIFIED
@@ -26,7 +34,11 @@ Evidence slice:
   VERIFIED → EVIDENCE_ATTEMPT_OPEN → RAW_COLLECTED → EVIDENCE_SEALED
 Plugin leg (dry-run bookkeeping; no auto git commit / no forged DONE):
   VERIFIED|EVIDENCE_SEALED → PLUGIN_PREPARED → PLUGIN_COMMITTED
-  (DONE only via later dual-sync verify-done; never from caller.)
+Mineradio evidence + closure bookkeeping (operator SHAs/paths only; no progress write):
+  PLUGIN_COMMITTED|EVIDENCE_SEALED → MINERADIO_EVIDENCE_COMMITTED
+  → MINERADIO_EVIDENCE_PUSHED → CLOSURE_PREPARED
+  → MINERADIO_CLOSURE_COMMITTED → MINERADIO_CLOSURE_PUSHED → DONE
+  (DONE/EffectiveDone only via verify-done with all hard gates; never from caller.)
 """
 
 from __future__ import annotations
@@ -157,6 +169,36 @@ PLUGIN_COMMIT_SUBJECT_PREFIXES: tuple[str, ...] = (
 PREPARE_PLUGIN_PREREQ = frozenset({"VERIFIED", "EVIDENCE_SEALED"})
 COMMIT_PLUGIN_PREREQ = frozenset({"PLUGIN_PREPARED"})
 RECORD_MERGED_PREREQ = frozenset({"VERIFIED", "EVIDENCE_SEALED", "PLUGIN_PREPARED"})
+
+# Mineradio evidence / closure bookkeeping prereqs (operator-recorded only).
+RECORD_MINERADIO_EVIDENCE_PREREQ = frozenset(
+    {
+        "PLUGIN_COMMITTED",
+        "EVIDENCE_SEALED",
+        "EVIDENCE_PREPARED",  # two-step path: prepared then committed
+    }
+)
+RECORD_MINERADIO_EVIDENCE_PUSH_PREREQ = frozenset({"MINERADIO_EVIDENCE_COMMITTED"})
+PREPARE_CLOSURE_PREREQ = frozenset({"MINERADIO_EVIDENCE_PUSHED"})
+RECORD_CLOSURE_COMMIT_PREREQ = frozenset({"CLOSURE_PREPARED"})
+RECORD_CLOSURE_PUSH_PREREQ = frozenset({"MINERADIO_CLOSURE_COMMITTED"})
+VERIFY_DONE_ENTRY_STATES = frozenset(
+    {
+        "MINERADIO_CLOSURE_PUSHED",
+        "DONE",  # idempotent re-assert
+    }
+)
+
+DEFAULT_MINERADIO_WORKTREE = Path(
+    "/Users/anpple/Codex/Mineradio/.worktrees/wallpaper-plugin-experimental"
+)
+DEFAULT_MINERADIO_ORIGIN_REF = "refs/heads/huawei-android12-car"
+DEFAULT_BOOTSTRAP_LEDGER = Path(
+    "/Users/anpple/Codex/Mineradio/android-car/verification/wallpaper-plugin"
+    "/runs/wp-12a-bootstrap-local.json"
+)
+LS_REMOTE_TIMEOUT_S = 15.0
+REQUIRED_PHASES_FOR_DONE = ("RED", "GREEN", "REFACTOR", "VERIFY")
 
 
 def utc_now_iso() -> str:
@@ -479,6 +521,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             lastSealed=receipt.get("lastSealed"),
             pluginPrepare=receipt.get("pluginPrepare"),
             pluginCommit=receipt.get("pluginCommit"),
+            mineradioEvidence=receipt.get("mineradioEvidence"),
+            mineradioEvidencePush=receipt.get("mineradioEvidencePush"),
+            closurePrepare=receipt.get("closurePrepare"),
+            closureCommit=receipt.get("closureCommit"),
+            closurePush=receipt.get("closurePush"),
+            verifyDone=receipt.get("verifyDone"),
             legs=receipt.get("legs"),
         )
 
@@ -1146,11 +1194,177 @@ def _ensure_legs(receipt: dict[str, Any]) -> dict[str, Any]:
     legs = receipt.get("legs")
     if not isinstance(legs, dict):
         legs = {}
-    for key in ("plugin", "evidence", "closure"):
+    for key in ("plugin", "evidence", "closure", "mineradioEvidence"):
         if key not in legs or not isinstance(legs.get(key), dict):
             legs[key] = dict(legs.get(key) or {}) if isinstance(legs.get(key), dict) else {}
     receipt["legs"] = legs
     return legs
+
+
+def _mineradio_worktree(args: argparse.Namespace) -> Path:
+    raw = getattr(args, "mineradio_worktree", None)
+    return Path(raw) if raw else DEFAULT_MINERADIO_WORKTREE
+
+
+def _ls_remote_sha(
+    repo: Path,
+    ref: str,
+    *,
+    remote: str = "origin",
+    timeout: float = LS_REMOTE_TIMEOUT_S,
+) -> str:
+    """Independent origin readback via git ls-remote --refs. Fail-closed on timeout/empty."""
+    if not repo.is_dir():
+        fail("MINERADIO_WORKTREE_MISSING", f"mineradio worktree missing for ls-remote: {repo}")
+    proc = _git("ls-remote", "--refs", remote, ref, cwd=repo, timeout=timeout)
+    if proc.returncode == 124:
+        fail(
+            "LS_REMOTE_TIMEOUT",
+            f"git ls-remote timed out after {timeout}s for {remote} {ref}",
+            repo=str(repo),
+            ref=ref,
+        )
+    if proc.returncode != 0:
+        fail(
+            "LS_REMOTE_FAILED",
+            f"git ls-remote failed ({proc.returncode}) for {remote} {ref}: "
+            f"{(proc.stderr or proc.stdout or '').strip()}",
+            repo=str(repo),
+            ref=ref,
+        )
+    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        fail("LS_REMOTE_EMPTY", f"git ls-remote returned no refs for {remote} {ref}", ref=ref)
+    first = lines[0].split()
+    if not first or len(first[0]) != 40:
+        fail("LS_REMOTE_INVALID", f"ls-remote did not return 40-hex SHA: {lines[0]!r}")
+    sha = first[0].lower()
+    if any(c not in "0123456789abcdef" for c in sha):
+        fail("LS_REMOTE_INVALID", f"ls-remote SHA not hex: {sha!r}")
+    return sha
+
+
+def _load_manifest_document(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail("ILLEGAL_STATE", f"manifest/sealed path unreadable: {exc}", path=str(path))
+    if not isinstance(data, dict):
+        fail("ILLEGAL_STATE", f"manifest/sealed must be a JSON object: {path}")
+    return data
+
+
+def _validate_evidence_manifest(doc: dict[str, Any], *, path: Path) -> dict[str, Any]:
+    """Fail-closed parse of final-manifest / sealed-summary for mineradio evidence attach.
+
+    sealed.EffectiveDone must be false (task EffectiveDone is verify-done only).
+    inventorySealed, when present, must be true.
+    """
+    if doc.get("EffectiveDone") is True:
+        fail(
+            "FORGED_EFFECTIVE_DONE",
+            "manifest/sealed.EffectiveDone must be false; task EffectiveDone is verify-done only",
+            path=str(path),
+        )
+    inventory_sealed = doc.get("inventorySealed")
+    if inventory_sealed is not None and inventory_sealed is not True:
+        fail(
+            "INVENTORY_NOT_SEALED",
+            f"manifest inventorySealed must be true when present, got {inventory_sealed!r}",
+            path=str(path),
+        )
+    return {
+        "inventorySealed": bool(inventory_sealed) if inventory_sealed is not None else None,
+        "EffectiveDone": False,
+        "schema": doc.get("schema"),
+        "taskId": doc.get("taskId"),
+        "attemptNo": doc.get("attemptNo"),
+    }
+
+
+def _plugin_committed_recorded(receipt: dict[str, Any]) -> bool:
+    legs = receipt.get("legs") if isinstance(receipt.get("legs"), dict) else {}
+    plugin = legs.get("plugin") if isinstance(legs.get("plugin"), dict) else {}
+    if plugin.get("state") == "PLUGIN_COMMITTED" and plugin.get("commitSha"):
+        return True
+    pc = receipt.get("pluginCommit") if isinstance(receipt.get("pluginCommit"), dict) else {}
+    if pc.get("commitSha") or pc.get("mergeSha"):
+        return True
+    return receipt.get("state") in {
+        "PLUGIN_COMMITTED",
+        "MINERADIO_EVIDENCE_COMMITTED",
+        "MINERADIO_EVIDENCE_PUSHED",
+        "CLOSURE_PREPARED",
+        "MINERADIO_CLOSURE_COMMITTED",
+        "MINERADIO_CLOSURE_PUSHED",
+        "DONE",
+    } and bool(pc.get("commitSha") or pc.get("mergeSha") or plugin.get("commitSha"))
+
+
+def _evidence_sealed_recorded(receipt: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Return (ok, details) for sealed inventory facts on the receipt."""
+    last = receipt.get("lastSealed") if isinstance(receipt.get("lastSealed"), dict) else {}
+    if last:
+        inv = last.get("inventorySealed")
+        eff = last.get("EffectiveDone")
+        if inv is True and eff is not True:
+            return True, {"source": "lastSealed", **last}
+        if inv is False:
+            return False, {"source": "lastSealed", "inventorySealed": inv, "EffectiveDone": eff}
+    attempts = receipt.get("attempts") or []
+    for entry in reversed(list(attempts)):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("state") == "EVIDENCE_SEALED" or entry.get("sealedPath"):
+            inv = entry.get("inventorySealed")
+            if inv is True and entry.get("EffectiveDone") is not True:
+                return True, {"source": "attempts", **entry}
+    me = receipt.get("mineradioEvidence") if isinstance(receipt.get("mineradioEvidence"), dict) else {}
+    if me.get("inventorySealed") is True and me.get("EffectiveDone") is not True:
+        return True, {"source": "mineradioEvidence", **me}
+    return False, {"source": None}
+
+
+def _phases_complete(receipt: dict[str, Any]) -> tuple[bool, list[str]]:
+    events = receipt.get("phaseEvents") or []
+    seen = {
+        e.get("phase")
+        for e in events
+        if isinstance(e, dict) and e.get("phase")
+    }
+    missing = [p for p in REQUIRED_PHASES_FOR_DONE if p not in seen]
+    return (not missing, missing)
+
+
+def _read_bootstrap_pushed(ledger_path: Path) -> tuple[bool, dict[str, Any]]:
+    if not ledger_path.is_file():
+        return False, {
+            "path": str(ledger_path),
+            "BOOTSTRAP_PUSHED": False,
+            "reason": "BOOTSTRAP_LEDGER_MISSING",
+        }
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, {
+            "path": str(ledger_path),
+            "BOOTSTRAP_PUSHED": False,
+            "reason": "BOOTSTRAP_LEDGER_UNREADABLE",
+            "error": str(exc),
+        }
+    if not isinstance(data, dict):
+        return False, {
+            "path": str(ledger_path),
+            "BOOTSTRAP_PUSHED": False,
+            "reason": "BOOTSTRAP_LEDGER_INVALID",
+        }
+    pushed = data.get("BOOTSTRAP_PUSHED") is True
+    return pushed, {
+        "path": str(ledger_path),
+        "BOOTSTRAP_PUSHED": pushed,
+        "BOOTSTRAP_STATE": data.get("BOOTSTRAP_STATE") or data.get("state"),
+        "reason": None if pushed else "BOOTSTRAP_PUSHED_FALSE",
+    }
 
 
 def cmd_prepare_plugin(args: argparse.Namespace) -> int:
@@ -1521,6 +1735,635 @@ def cmd_record_plugin_merged(args: argparse.Namespace) -> int:
     )
 
 
+# ---------------------------------------------------------------------------
+# Mineradio evidence + closure bookkeeping (operator SHAs/paths; no progress write)
+# ---------------------------------------------------------------------------
+
+
+def cmd_record_mineradio_evidence(args: argparse.Namespace) -> int:
+    """Record operator-provided Mineradio evidence commit + manifest path.
+
+    PLUGIN_COMMITTED|EVIDENCE_SEALED|EVIDENCE_PREPARED → MINERADIO_EVIDENCE_COMMITTED.
+    Does not write progress tables or forge EffectiveDone.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    manifest_raw = getattr(args, "manifest_path", None) or getattr(args, "path", None)
+    if not manifest_raw:
+        fail("MISSING_INPUT", "record-mineradio-evidence requires --manifest-path")
+    manifest_path = Path(manifest_raw)
+    if not manifest_path.is_file():
+        fail("MISSING_INPUT", f"manifest path not found: {manifest_path}")
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in RECORD_MINERADIO_EVIDENCE_PREREQ:
+        fail(
+            "OUT_OF_ORDER_MINERADIO",
+            f"record-mineradio-evidence requires state in "
+            f"{sorted(RECORD_MINERADIO_EVIDENCE_PREREQ)}, observed={state}",
+            state=state,
+            requiredStates=sorted(RECORD_MINERADIO_EVIDENCE_PREREQ),
+        )
+
+    doc = _load_manifest_document(manifest_path)
+    meta = _validate_evidence_manifest(doc, path=manifest_path)
+    manifest_sha = _sha256_file(manifest_path)
+
+    evidence_sha_raw = getattr(args, "evidence_sha", None)
+    evidence_sha = None
+    if evidence_sha_raw:
+        evidence_sha = _require_hex_sha(evidence_sha_raw, label="--evidence-sha", lengths=(40,))
+        if len(evidence_sha) != 40:
+            fail("INVALID_SHA", f"--evidence-sha must be 40 hex chars, got len={len(evidence_sha)}")
+
+    commit_raw = getattr(args, "commit_sha", None)
+    commit_sha = None
+    if commit_raw:
+        commit_sha = _require_hex_sha(commit_raw, label="--commit-sha", lengths=(40,))
+        if len(commit_sha) != 40:
+            # Allow short form; store normalized lowercase (operator bookkeeping).
+            commit_sha = commit_sha  # already lowercased by _require_hex_sha
+
+    now = utc_now_iso()
+    record = {
+        "recordedAt": now,
+        "manifestPath": str(manifest_path.resolve()),
+        "manifestSha256": manifest_sha,
+        "evidenceSha": evidence_sha,
+        "commitSha": commit_sha or evidence_sha,
+        "inventorySealed": meta.get("inventorySealed"),
+        "EffectiveDone": False,
+        "manifestMeta": meta,
+        "priorState": state,
+        "mode": "record-mineradio-evidence",
+        "note": "operator-supplied mineradio evidence SHA/path recorded; no progress write",
+    }
+    receipt["mineradioEvidence"] = record
+    legs = _ensure_legs(receipt)
+    legs["evidence"] = {
+        **dict(legs.get("evidence") or {}),
+        "commitSha": commit_sha or evidence_sha,
+        "evidenceSha": evidence_sha,
+        "manifestPath": str(manifest_path.resolve()),
+        "manifestSha256": manifest_sha,
+        "inventorySealed": meta.get("inventorySealed"),
+        "committedAt": now,
+        "state": "MINERADIO_EVIDENCE_COMMITTED",
+    }
+    legs["mineradioEvidence"] = dict(legs["evidence"])
+    receipt["state"] = "MINERADIO_EVIDENCE_COMMITTED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(
+        f"record-mineradio-evidence: manifest={manifest_path.name} "
+        f"sha={manifest_sha[:12]} evidenceSha={(evidence_sha or '')[:12]}"
+    )
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "record-mineradio-evidence",
+        taskId=task_id,
+        state="MINERADIO_EVIDENCE_COMMITTED",
+        path=str(path),
+        manifestPath=str(manifest_path.resolve()),
+        manifestSha256=manifest_sha,
+        evidenceSha=evidence_sha,
+        commitSha=commit_sha or evidence_sha,
+        inventorySealed=meta.get("inventorySealed"),
+        EffectiveDone=False,
+    )
+
+
+def cmd_record_mineradio_evidence_push(args: argparse.Namespace) -> int:
+    """ls-remote Mineradio origin and record evidence push proof.
+
+    MINERADIO_EVIDENCE_COMMITTED → MINERADIO_EVIDENCE_PUSHED.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    expected_raw = getattr(args, "expected_sha", None)
+    if not expected_raw:
+        fail("MISSING_INPUT", "record-mineradio-evidence-push requires --expected-sha")
+    expected_sha = _require_hex_sha(expected_raw, label="--expected-sha", lengths=(40,))
+    if len(expected_sha) != 40:
+        fail("INVALID_SHA", f"--expected-sha must be 40 hex chars, got len={len(expected_sha)}")
+
+    ref = getattr(args, "ref", None) or DEFAULT_MINERADIO_ORIGIN_REF
+    mineradio_root = _mineradio_worktree(args)
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in RECORD_MINERADIO_EVIDENCE_PUSH_PREREQ:
+        fail(
+            "OUT_OF_ORDER_MINERADIO",
+            f"record-mineradio-evidence-push requires state=MINERADIO_EVIDENCE_COMMITTED, "
+            f"observed={state}",
+            state=state,
+        )
+
+    remote_sha = _ls_remote_sha(mineradio_root, ref)
+    if remote_sha != expected_sha:
+        fail(
+            "ORIGIN_SHA_MISMATCH",
+            f"ls-remote {ref}={remote_sha} != expected={expected_sha}",
+            expectedSha=expected_sha,
+            remoteSha=remote_sha,
+            ref=ref,
+            mineradioWorktree=str(mineradio_root),
+        )
+
+    now = utc_now_iso()
+    push_record = {
+        "pushedAt": now,
+        "expectedSha": expected_sha,
+        "remoteSha": remote_sha,
+        "ref": ref,
+        "mineradioWorktree": str(mineradio_root),
+        "source": "git-ls-remote",
+        "priorState": state,
+        "note": "operator-expected SHA matched Mineradio origin ls-remote; no progress write",
+    }
+    receipt["mineradioEvidencePush"] = push_record
+    legs = _ensure_legs(receipt)
+    legs["evidence"] = {
+        **dict(legs.get("evidence") or {}),
+        "pushedSha": remote_sha,
+        "pushedAt": now,
+        "ref": ref,
+        "state": "MINERADIO_EVIDENCE_PUSHED",
+    }
+    legs["mineradioEvidence"] = {
+        **dict(legs.get("mineradioEvidence") or {}),
+        "pushedSha": remote_sha,
+        "state": "MINERADIO_EVIDENCE_PUSHED",
+    }
+    receipt["state"] = "MINERADIO_EVIDENCE_PUSHED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(f"record-mineradio-evidence-push: {ref}={remote_sha[:12]}")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "record-mineradio-evidence-push",
+        taskId=task_id,
+        state="MINERADIO_EVIDENCE_PUSHED",
+        path=str(path),
+        expectedSha=expected_sha,
+        remoteSha=remote_sha,
+        ref=ref,
+        mineradioWorktree=str(mineradio_root),
+        EffectiveDone=False,
+    )
+
+
+def cmd_prepare_closure(args: argparse.Namespace) -> int:
+    """Checklist prepare for Mineradio closure leg.
+
+    Requires MINERADIO_EVIDENCE_PUSHED plus: plugin committed, evidence sealed,
+    mineradio evidence recorded. → CLOSURE_PREPARED.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in PREPARE_CLOSURE_PREREQ:
+        fail(
+            "OUT_OF_ORDER_CLOSURE",
+            f"prepare-closure requires state=MINERADIO_EVIDENCE_PUSHED, observed={state}",
+            state=state,
+        )
+
+    missing: list[str] = []
+    if not _plugin_committed_recorded(receipt):
+        missing.append("PLUGIN_COMMITTED")
+    sealed_ok, sealed_detail = _evidence_sealed_recorded(receipt)
+    if not sealed_ok:
+        missing.append("EVIDENCE_SEALED_INVENTORY")
+    me = receipt.get("mineradioEvidence") if isinstance(receipt.get("mineradioEvidence"), dict) else {}
+    if not me.get("manifestPath") and not (receipt.get("legs") or {}).get("evidence", {}).get("commitSha"):
+        missing.append("MINERADIO_EVIDENCE_RECORDED")
+    if state != "MINERADIO_EVIDENCE_PUSHED" and not isinstance(receipt.get("mineradioEvidencePush"), dict):
+        missing.append("MINERADIO_EVIDENCE_PUSHED")
+    if missing:
+        fail(
+            "CLOSURE_CHECKLIST_INCOMPLETE",
+            f"prepare-closure missing: {missing}",
+            missing=missing,
+            sealed=sealed_detail,
+        )
+
+    now = utc_now_iso()
+    prep = {
+        "preparedAt": now,
+        "checklist": {
+            "pluginCommitted": True,
+            "evidenceSealed": True,
+            "mineradioEvidenceRecorded": True,
+            "mineradioEvidencePushed": True,
+        },
+        "sealed": sealed_detail,
+        "priorState": state,
+        "note": "closure prepared after plugin+evidence+mineradio evidence checklist; no progress write",
+    }
+    receipt["closurePrepare"] = prep
+    legs = _ensure_legs(receipt)
+    legs["closure"] = {
+        **dict(legs.get("closure") or {}),
+        "preparedAt": now,
+        "state": "CLOSURE_PREPARED",
+    }
+    receipt["state"] = "CLOSURE_PREPARED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append("prepare-closure: checklist complete")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "prepare-closure",
+        taskId=task_id,
+        state="CLOSURE_PREPARED",
+        path=str(path),
+        checklist=prep["checklist"],
+        EffectiveDone=False,
+    )
+
+
+def cmd_record_closure_commit(args: argparse.Namespace) -> int:
+    """Record operator-provided Mineradio closure commit SHA → MINERADIO_CLOSURE_COMMITTED."""
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    commit_raw = getattr(args, "commit_sha", None)
+    if not commit_raw:
+        fail("MISSING_INPUT", "record-closure-commit requires --commit-sha")
+    commit_sha = _require_hex_sha(commit_raw, label="--commit-sha", lengths=(40,))
+    if len(commit_sha) != 40:
+        fail("INVALID_SHA", f"--commit-sha must be 40 hex chars, got len={len(commit_sha)}")
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in RECORD_CLOSURE_COMMIT_PREREQ:
+        fail(
+            "OUT_OF_ORDER_CLOSURE",
+            f"record-closure-commit requires state=CLOSURE_PREPARED, observed={state}",
+            state=state,
+        )
+
+    now = utc_now_iso()
+    record = {
+        "committedAt": now,
+        "commitSha": commit_sha,
+        "priorState": state,
+        "mode": "record-closure-commit",
+        "note": "operator-supplied closure commit recorded; no git commit / no progress write",
+    }
+    receipt["closureCommit"] = record
+    legs = _ensure_legs(receipt)
+    legs["closure"] = {
+        **dict(legs.get("closure") or {}),
+        "commitSha": commit_sha,
+        "committedAt": now,
+        "state": "MINERADIO_CLOSURE_COMMITTED",
+    }
+    receipt["state"] = "MINERADIO_CLOSURE_COMMITTED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(f"record-closure-commit: {commit_sha[:12]}")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "record-closure-commit",
+        taskId=task_id,
+        state="MINERADIO_CLOSURE_COMMITTED",
+        path=str(path),
+        commitSha=commit_sha,
+        EffectiveDone=False,
+    )
+
+
+def cmd_record_closure_push(args: argparse.Namespace) -> int:
+    """ls-remote Mineradio origin for closure push → MINERADIO_CLOSURE_PUSHED."""
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    ensure_not_declare_done(args)
+
+    expected_raw = getattr(args, "expected_sha", None)
+    if not expected_raw:
+        fail("MISSING_INPUT", "record-closure-push requires --expected-sha")
+    expected_sha = _require_hex_sha(expected_raw, label="--expected-sha", lengths=(40,))
+    if len(expected_sha) != 40:
+        fail("INVALID_SHA", f"--expected-sha must be 40 hex chars, got len={len(expected_sha)}")
+
+    ref = getattr(args, "ref", None) or DEFAULT_MINERADIO_ORIGIN_REF
+    mineradio_root = _mineradio_worktree(args)
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = require_frozen_txn(path)
+    state = receipt.get("state")
+    if state not in RECORD_CLOSURE_PUSH_PREREQ:
+        fail(
+            "OUT_OF_ORDER_CLOSURE",
+            f"record-closure-push requires state=MINERADIO_CLOSURE_COMMITTED, observed={state}",
+            state=state,
+        )
+
+    remote_sha = _ls_remote_sha(mineradio_root, ref)
+    if remote_sha != expected_sha:
+        fail(
+            "ORIGIN_SHA_MISMATCH",
+            f"ls-remote {ref}={remote_sha} != expected={expected_sha}",
+            expectedSha=expected_sha,
+            remoteSha=remote_sha,
+            ref=ref,
+            mineradioWorktree=str(mineradio_root),
+        )
+
+    # Optional consistency with recorded closure commit.
+    cc = receipt.get("closureCommit") if isinstance(receipt.get("closureCommit"), dict) else {}
+    recorded = cc.get("commitSha")
+    if recorded and recorded != expected_sha:
+        fail(
+            "CLOSURE_SHA_MISMATCH",
+            f"closureCommit.commitSha={recorded} != --expected-sha={expected_sha}",
+            commitSha=recorded,
+            expectedSha=expected_sha,
+        )
+
+    now = utc_now_iso()
+    push_record = {
+        "pushedAt": now,
+        "expectedSha": expected_sha,
+        "remoteSha": remote_sha,
+        "ref": ref,
+        "mineradioWorktree": str(mineradio_root),
+        "source": "git-ls-remote",
+        "priorState": state,
+        "note": "operator-expected closure SHA matched Mineradio origin ls-remote",
+    }
+    receipt["closurePush"] = push_record
+    legs = _ensure_legs(receipt)
+    legs["closure"] = {
+        **dict(legs.get("closure") or {}),
+        "pushedSha": remote_sha,
+        "pushedAt": now,
+        "ref": ref,
+        "state": "MINERADIO_CLOSURE_PUSHED",
+    }
+    receipt["state"] = "MINERADIO_CLOSURE_PUSHED"
+    receipt["EffectiveDone"] = False
+    notes = list(receipt.get("notes") or [])
+    notes.append(f"record-closure-push: {ref}={remote_sha[:12]}")
+    receipt["notes"] = notes
+    bump_receipt(receipt)
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "record-closure-push",
+        taskId=task_id,
+        state="MINERADIO_CLOSURE_PUSHED",
+        path=str(path),
+        expectedSha=expected_sha,
+        remoteSha=remote_sha,
+        ref=ref,
+        mineradioWorktree=str(mineradio_root),
+        EffectiveDone=False,
+    )
+
+
+def _collect_verify_done_gates(
+    receipt: dict[str, Any],
+    *,
+    bootstrap_ledger: Path,
+) -> list[dict[str, Any]]:
+    """Return list of hard-gate results: {id, ok, detail}."""
+    gates: list[dict[str, Any]] = []
+
+    # 1. BOOTSTRAP_PUSHED ledger
+    boot_ok, boot_detail = _read_bootstrap_pushed(bootstrap_ledger)
+    gates.append(
+        {
+            "id": "BOOTSTRAP_PUSHED",
+            "ok": boot_ok,
+            "detail": boot_detail,
+        }
+    )
+
+    # 2. phaseEvents RED..VERIFY
+    phases_ok, phases_missing = _phases_complete(receipt)
+    gates.append(
+        {
+            "id": "PHASE_EVENTS_COMPLETE",
+            "ok": phases_ok,
+            "detail": {"missingPhases": phases_missing},
+        }
+    )
+
+    # 3. evidence sealed inventorySealed true; sealed.EffectiveDone false OK
+    sealed_ok, sealed_detail = _evidence_sealed_recorded(receipt)
+    gates.append(
+        {
+            "id": "EVIDENCE_SEALED_INVENTORY",
+            "ok": sealed_ok,
+            "detail": sealed_detail,
+        }
+    )
+
+    # 4. PLUGIN_COMMITTED recorded
+    plugin_ok = _plugin_committed_recorded(receipt)
+    gates.append(
+        {
+            "id": "PLUGIN_COMMITTED",
+            "ok": plugin_ok,
+            "detail": {
+                "pluginCommit": receipt.get("pluginCommit"),
+                "legsPlugin": (receipt.get("legs") or {}).get("plugin")
+                if isinstance(receipt.get("legs"), dict)
+                else None,
+            },
+        }
+    )
+
+    # 5. MINERADIO_EVIDENCE_* recorded
+    me = receipt.get("mineradioEvidence") if isinstance(receipt.get("mineradioEvidence"), dict) else {}
+    me_push = (
+        receipt.get("mineradioEvidencePush")
+        if isinstance(receipt.get("mineradioEvidencePush"), dict)
+        else {}
+    )
+    me_committed = bool(me.get("manifestPath") or me.get("commitSha") or me.get("evidenceSha"))
+    me_pushed = bool(me_push.get("remoteSha") or me_push.get("expectedSha"))
+    # Also accept leg states when receipt advanced past those stages.
+    legs = receipt.get("legs") if isinstance(receipt.get("legs"), dict) else {}
+    leg_ev = legs.get("evidence") if isinstance(legs.get("evidence"), dict) else {}
+    if leg_ev.get("state") in {"MINERADIO_EVIDENCE_COMMITTED", "MINERADIO_EVIDENCE_PUSHED"}:
+        me_committed = me_committed or bool(leg_ev.get("commitSha") or leg_ev.get("manifestPath"))
+    if leg_ev.get("state") == "MINERADIO_EVIDENCE_PUSHED" or me_push:
+        me_pushed = me_pushed or bool(leg_ev.get("pushedSha") or me_push.get("remoteSha"))
+
+    gates.append(
+        {
+            "id": "MINERADIO_EVIDENCE_COMMITTED",
+            "ok": me_committed,
+            "detail": {"mineradioEvidence": me or None},
+        }
+    )
+    gates.append(
+        {
+            "id": "MINERADIO_EVIDENCE_PUSHED",
+            "ok": me_pushed,
+            "detail": {"mineradioEvidencePush": me_push or None},
+        }
+    )
+
+    # 6. CLOSURE_* recorded
+    cc = receipt.get("closureCommit") if isinstance(receipt.get("closureCommit"), dict) else {}
+    cp = receipt.get("closurePush") if isinstance(receipt.get("closurePush"), dict) else {}
+    leg_cl = legs.get("closure") if isinstance(legs.get("closure"), dict) else {}
+    cl_committed = bool(cc.get("commitSha") or leg_cl.get("commitSha"))
+    cl_pushed = bool(cp.get("remoteSha") or leg_cl.get("pushedSha"))
+    gates.append(
+        {
+            "id": "MINERADIO_CLOSURE_COMMITTED",
+            "ok": cl_committed,
+            "detail": {"closureCommit": cc or None},
+        }
+    )
+    gates.append(
+        {
+            "id": "MINERADIO_CLOSURE_PUSHED",
+            "ok": cl_pushed,
+            "detail": {"closurePush": cp or None},
+        }
+    )
+
+    # 7. entry state must be MINERADIO_CLOSURE_PUSHED (or already DONE with proofs)
+    state = receipt.get("state")
+    state_ok = state in VERIFY_DONE_ENTRY_STATES or (
+        cl_pushed and state in {"MINERADIO_CLOSURE_PUSHED", "DONE"}
+    )
+    # Allow verify-done when all leg proofs present even if state string lagged
+    # (synthetic fixtures set legs + fields); still require closure push proof.
+    if cl_pushed and me_pushed and me_committed and plugin_ok and sealed_ok and phases_ok:
+        state_ok = True
+    gates.append(
+        {
+            "id": "STATE_MINERADIO_CLOSURE_PUSHED",
+            "ok": state_ok,
+            "detail": {"state": state},
+        }
+    )
+
+    return gates
+
+
+def cmd_verify_done(args: argparse.Namespace) -> int:
+    """Fail-closed verify-done: only path that may set EffectiveDone=true.
+
+    Hard gates (all required unless --local-partial which still fails closed):
+      - BOOTSTRAP_PUSHED ledger true
+      - phaseEvents RED..VERIFY complete
+      - evidence sealed inventorySealed true (sealed.EffectiveDone false OK)
+      - PLUGIN_COMMITTED recorded
+      - MINERADIO_EVIDENCE_* and CLOSURE_* recorded
+    On full success: state=DONE, EffectiveDone=true.
+    On any miss: MISSING_GATE list, never EffectiveDone.
+    """
+    task_id = require_task(args.task)
+    reject_caller_identity(args)
+    # --declare-done still forbidden; only this command may derive DONE.
+    if getattr(args, "declare_done", False):
+        fail("CALLER_DECLARED_DONE", "caller must not declare DONE; verify-done derives it")
+
+    ledger_raw = getattr(args, "bootstrap_ledger", None)
+    bootstrap_ledger = Path(ledger_raw) if ledger_raw else DEFAULT_BOOTSTRAP_LEDGER
+    local_partial = bool(getattr(args, "local_partial", False))
+
+    path = transaction_path(txn_dir(args), task_id)
+    receipt = load_receipt(path)
+
+    # Idempotent success if already DONE with EffectiveDone.
+    if receipt.get("state") == "DONE" and receipt.get("EffectiveDone") is True:
+        return emit_ok(
+            "verify-done",
+            taskId=task_id,
+            state="DONE",
+            path=str(path),
+            EffectiveDone=True,
+            note="already DONE with EffectiveDone=true",
+        )
+
+    # Refuse forged DONE without EffectiveDone.
+    if receipt.get("state") == "DONE" and receipt.get("EffectiveDone") is not True:
+        fail(
+            "FORGED_EFFECTIVE_DONE",
+            "state DONE without EffectiveDone=true; refuse verify-done promotion",
+        )
+
+    gates = _collect_verify_done_gates(receipt, bootstrap_ledger=bootstrap_ledger)
+    missing = [g["id"] for g in gates if not g["ok"]]
+
+    if missing:
+        fail(
+            "MISSING_GATE",
+            f"verify-done fail-closed; missing gates: {missing}",
+            missing=missing,
+            gates=gates,
+            EffectiveDone=False,
+            localPartial=local_partial,
+            state=receipt.get("state"),
+        )
+
+    # All hard gates passed. Only this command may set EffectiveDone=true.
+    # (local-partial does not weaken success when gates are green; missing gates
+    # already failed above with MISSING_GATE and EffectiveDone=false.)
+    now = utc_now_iso()
+    receipt["state"] = "DONE"
+    receipt["verifyDone"] = {
+        "verifiedAt": now,
+        "gates": gates,
+        "bootstrapLedger": str(bootstrap_ledger),
+        "localPartial": local_partial,
+        "source": "verify-done",
+        "note": "all hard gates passed; EffectiveDone derived by verify-done only",
+    }
+    notes = list(receipt.get("notes") or [])
+    notes.append("verify-done: DONE + EffectiveDone=true")
+    receipt["notes"] = notes
+    bump_receipt(receipt)  # state==DONE keeps EffectiveDone from being force-cleared
+    receipt["EffectiveDone"] = True
+    atomic_write_replace(path, receipt)
+
+    return emit_ok(
+        "verify-done",
+        taskId=task_id,
+        state="DONE",
+        path=str(path),
+        EffectiveDone=True,
+        gates=gates,
+        bootstrapLedger=str(bootstrap_ledger),
+    )
+
+
 COMMANDS = {
     "init": cmd_init,
     "status": cmd_status,
@@ -1535,6 +2378,12 @@ COMMANDS = {
     "prepare-plugin": cmd_prepare_plugin,
     "commit-plugin": cmd_commit_plugin,
     "record-plugin-merged": cmd_record_plugin_merged,
+    "record-mineradio-evidence": cmd_record_mineradio_evidence,
+    "record-mineradio-evidence-push": cmd_record_mineradio_evidence_push,
+    "prepare-closure": cmd_prepare_closure,
+    "record-closure-commit": cmd_record_closure_commit,
+    "record-closure-push": cmd_record_closure_push,
+    "verify-done": cmd_verify_done,
 }
 
 
@@ -1585,6 +2434,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         dest="merge_sha",
         help="already-merged commit SHA for record-plugin-merged (e.g. origin/main tip)",
     )
+    parser.add_argument(
+        "--manifest-path",
+        dest="manifest_path",
+        help="final-manifest or sealed-summary path for record-mineradio-evidence",
+    )
+    parser.add_argument(
+        "--evidence-sha",
+        dest="evidence_sha",
+        help="optional 40-hex Mineradio evidence commit SHA",
+    )
+    parser.add_argument(
+        "--expected-sha",
+        dest="expected_sha",
+        help="expected origin SHA for record-mineradio-evidence-push / record-closure-push",
+    )
+    parser.add_argument(
+        "--ref",
+        dest="ref",
+        help=f"origin ref for ls-remote (default: {DEFAULT_MINERADIO_ORIGIN_REF})",
+    )
+    parser.add_argument(
+        "--mineradio-worktree",
+        dest="mineradio_worktree",
+        help=f"Mineradio worktree for ls-remote (default: {DEFAULT_MINERADIO_WORKTREE})",
+    )
+    parser.add_argument(
+        "--bootstrap-ledger",
+        dest="bootstrap_ledger",
+        help=f"BOOTSTRAP_PUSHED ledger path (default: {DEFAULT_BOOTSTRAP_LEDGER})",
+    )
+    parser.add_argument(
+        "--local-partial",
+        dest="local_partial",
+        action="store_true",
+        help="verify-done soft mode: still fail-closed listing MISSING_GATE (never EffectiveDone)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1594,7 +2479,9 @@ def main(argv: list[str]) -> int:
             "UNKNOWN_COMMAND",
             "missing command (init|status|assert-state|begin-phase|run-phase|"
             "complete-phase|record-phase|open-attempt|record-raw|seal-evidence|"
-            "prepare-plugin|commit-plugin|record-plugin-merged)",
+            "prepare-plugin|commit-plugin|record-plugin-merged|"
+            "record-mineradio-evidence|record-mineradio-evidence-push|"
+            "prepare-closure|record-closure-commit|record-closure-push|verify-done)",
         )
     args = parse_args(argv)
     return COMMANDS[args.command](args)

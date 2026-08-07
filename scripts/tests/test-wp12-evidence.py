@@ -1061,5 +1061,442 @@ class TestPluginLegBookkeeping(unittest.TestCase):
             self.assertEqual(len(receipt.get("phaseEvents") or []), 4)
 
 
+class TestMineradioClosureAndVerifyDone(unittest.TestCase):
+    """Mineradio evidence/closure bookkeeping + fail-closed verify-done."""
+
+    MERGED_SHA = "4255a9f16141818ba0beeab9bde1eddb0f862c31"
+    FAKE_EVIDENCE_SHA = "a" * 40
+    FAKE_CLOSURE_SHA = "b" * 40
+
+    def _init_local(self, tmp: str) -> Path:
+        init = run_py(
+            TXN_PY,
+            "init",
+            "--task",
+            "WP-12A",
+            "--transactions",
+            tmp,
+            "--local-only",
+            "--plugin-base-sha",
+            "9968140147ff6f2471451cc270084bb8ae3a683e",
+            "--mineradio-base-sha",
+            "e00f8f87753a31070b40754223e2a216c5322827",
+        )
+        self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+        return Path(tmp) / "wp-12a.json"
+
+    def _write_sealed_manifest(self, directory: Path, *, inventory_sealed: bool = True) -> Path:
+        path = directory / "final-manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "wp12-evidence/v1",
+                    "taskId": "WP-12A",
+                    "inventorySealed": inventory_sealed,
+                    "EffectiveDone": False,
+                    "attemptNo": 1,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _stamp_phases_and_plugin(self, txn_path: Path, *, state: str) -> None:
+        receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+        receipt["state"] = state
+        receipt["phaseEvents"] = [
+            {"phase": "RED", "stateAfter": "RED_RECORDED"},
+            {"phase": "GREEN", "stateAfter": "GREEN_RECORDED"},
+            {"phase": "REFACTOR", "stateAfter": "REFACTOR_RECORDED"},
+            {"phase": "VERIFY", "stateAfter": "VERIFIED"},
+        ]
+        receipt["EffectiveDone"] = False
+        receipt["pluginCommit"] = {
+            "commitSha": self.MERGED_SHA,
+            "mergeSha": self.MERGED_SHA,
+            "mode": "record-plugin-merged",
+        }
+        receipt["legs"] = {
+            "plugin": {
+                "state": "PLUGIN_COMMITTED",
+                "commitSha": self.MERGED_SHA,
+            },
+            "evidence": {},
+            "closure": {},
+        }
+        receipt["lastSealed"] = {
+            "attemptNo": 1,
+            "path": "/tmp/sealed.json",
+            "sha256": "c" * 64,
+            "inventorySealed": True,
+            "EffectiveDone": False,
+        }
+        txn_path.write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _write_bootstrap_ledger(self, directory: Path, *, pushed: bool) -> Path:
+        path = directory / "bootstrap-ledger.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "taskId": "WP-12-BOOTSTRAP",
+                    "BOOTSTRAP_STATE": "BOOTSTRAP_PUSHED" if pushed else "SCAFFOLD_ONLY",
+                    "BOOTSTRAP_PUSHED": pushed,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_cannot_verify_done_from_evidence_sealed_alone(self) -> None:
+        """RED: EVIDENCE_SEALED alone must never promote DONE/EffectiveDone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="EVIDENCE_SEALED")
+            ledger = self._write_bootstrap_ledger(Path(tmp), pushed=True)
+
+            proc = run_py(
+                TXN_PY,
+                "verify-done",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--bootstrap-ledger",
+                str(ledger),
+            )
+            self.assertNotEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+            payload = parse_json_stdout(proc)
+            self.assertFalse(payload.get("ok"))
+            self.assertEqual(payload.get("failureReason"), "MISSING_GATE")
+            missing = payload.get("missing") or []
+            self.assertIn("MINERADIO_EVIDENCE_COMMITTED", missing)
+            self.assertIn("MINERADIO_EVIDENCE_PUSHED", missing)
+            self.assertIn("MINERADIO_CLOSURE_COMMITTED", missing)
+            self.assertIn("MINERADIO_CLOSURE_PUSHED", missing)
+            self.assertIs(payload.get("EffectiveDone"), False)
+
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "EVIDENCE_SEALED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+    def test_effective_done_false_until_verify_done_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="PLUGIN_COMMITTED")
+            manifest = self._write_sealed_manifest(Path(tmp))
+
+            rec = run_py(
+                TXN_PY,
+                "record-mineradio-evidence",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--manifest-path",
+                str(manifest),
+                "--evidence-sha",
+                self.FAKE_EVIDENCE_SHA,
+            )
+            self.assertEqual(rec.returncode, 0, msg=rec.stdout + rec.stderr)
+            payload = parse_json_stdout(rec)
+            self.assertEqual(payload.get("state"), "MINERADIO_EVIDENCE_COMMITTED")
+            self.assertIs(payload.get("EffectiveDone"), False)
+
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "MINERADIO_EVIDENCE_COMMITTED")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+            # assert-state DONE still fails
+            done = run_py(
+                TXN_PY,
+                "assert-state",
+                "--task",
+                "WP-12A",
+                "--expected",
+                "DONE",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(done.returncode, 0)
+            self.assertEqual(parse_json_stdout(done).get("failureReason"), "ILLEGAL_STATE")
+
+    def test_out_of_order_mineradio_commands_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init_local(tmp)
+            manifest = self._write_sealed_manifest(Path(tmp))
+
+            # From TREE_FROZEN: record-mineradio-evidence is out of order
+            rec = run_py(
+                TXN_PY,
+                "record-mineradio-evidence",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--manifest-path",
+                str(manifest),
+                "--evidence-sha",
+                self.FAKE_EVIDENCE_SHA,
+            )
+            self.assertNotEqual(rec.returncode, 0)
+            self.assertEqual(parse_json_stdout(rec).get("failureReason"), "OUT_OF_ORDER_MINERADIO")
+
+            push = run_py(
+                TXN_PY,
+                "record-mineradio-evidence-push",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--expected-sha",
+                self.FAKE_EVIDENCE_SHA,
+            )
+            self.assertNotEqual(push.returncode, 0)
+            self.assertEqual(parse_json_stdout(push).get("failureReason"), "OUT_OF_ORDER_MINERADIO")
+
+            prep = run_py(
+                TXN_PY,
+                "prepare-closure",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+            )
+            self.assertNotEqual(prep.returncode, 0)
+            self.assertEqual(parse_json_stdout(prep).get("failureReason"), "OUT_OF_ORDER_CLOSURE")
+
+            cl_commit = run_py(
+                TXN_PY,
+                "record-closure-commit",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--commit-sha",
+                self.FAKE_CLOSURE_SHA,
+            )
+            self.assertNotEqual(cl_commit.returncode, 0)
+            self.assertEqual(parse_json_stdout(cl_commit).get("failureReason"), "OUT_OF_ORDER_CLOSURE")
+
+            cl_push = run_py(
+                TXN_PY,
+                "record-closure-push",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--expected-sha",
+                self.FAKE_CLOSURE_SHA,
+            )
+            self.assertNotEqual(cl_push.returncode, 0)
+            self.assertEqual(parse_json_stdout(cl_push).get("failureReason"), "OUT_OF_ORDER_CLOSURE")
+
+    def test_forged_effective_done_on_manifest_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="PLUGIN_COMMITTED")
+            bad = Path(tmp) / "forged-manifest.json"
+            bad.write_text(
+                json.dumps({"inventorySealed": True, "EffectiveDone": True}) + "\n",
+                encoding="utf-8",
+            )
+            rec = run_py(
+                TXN_PY,
+                "record-mineradio-evidence",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--manifest-path",
+                str(bad),
+                "--evidence-sha",
+                self.FAKE_EVIDENCE_SHA,
+            )
+            self.assertNotEqual(rec.returncode, 0)
+            self.assertEqual(parse_json_stdout(rec).get("failureReason"), "FORGED_EFFECTIVE_DONE")
+
+    def test_full_synthetic_fixture_reaches_done(self) -> None:
+        """GREEN: temp ledger + stamped proofs → verify-done → DONE/EffectiveDone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="MINERADIO_CLOSURE_PUSHED")
+            ledger = self._write_bootstrap_ledger(Path(tmp), pushed=True)
+
+            # Stamp full mineradio evidence + closure proofs (mocked; no real ls-remote).
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            receipt["mineradioEvidence"] = {
+                "manifestPath": str(Path(tmp) / "final-manifest.json"),
+                "manifestSha256": "d" * 64,
+                "evidenceSha": self.FAKE_EVIDENCE_SHA,
+                "commitSha": self.FAKE_EVIDENCE_SHA,
+                "inventorySealed": True,
+                "EffectiveDone": False,
+            }
+            receipt["mineradioEvidencePush"] = {
+                "expectedSha": self.FAKE_EVIDENCE_SHA,
+                "remoteSha": self.FAKE_EVIDENCE_SHA,
+                "ref": "refs/heads/huawei-android12-car",
+            }
+            receipt["closureCommit"] = {"commitSha": self.FAKE_CLOSURE_SHA}
+            receipt["closurePush"] = {
+                "expectedSha": self.FAKE_CLOSURE_SHA,
+                "remoteSha": self.FAKE_CLOSURE_SHA,
+                "ref": "refs/heads/huawei-android12-car",
+            }
+            receipt["legs"]["evidence"] = {
+                "state": "MINERADIO_EVIDENCE_PUSHED",
+                "commitSha": self.FAKE_EVIDENCE_SHA,
+                "pushedSha": self.FAKE_EVIDENCE_SHA,
+                "inventorySealed": True,
+            }
+            receipt["legs"]["closure"] = {
+                "state": "MINERADIO_CLOSURE_PUSHED",
+                "commitSha": self.FAKE_CLOSURE_SHA,
+                "pushedSha": self.FAKE_CLOSURE_SHA,
+            }
+            receipt["EffectiveDone"] = False
+            txn_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+
+            # Still not EffectiveDone before verify-done
+            self.assertFalse(
+                json.loads(txn_path.read_text(encoding="utf-8")).get("EffectiveDone")
+            )
+
+            proc = run_py(
+                TXN_PY,
+                "verify-done",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--bootstrap-ledger",
+                str(ledger),
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+            payload = parse_json_stdout(proc)
+            self.assertTrue(payload.get("ok"))
+            self.assertEqual(payload.get("state"), "DONE")
+            self.assertIs(payload.get("EffectiveDone"), True)
+
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "DONE")
+            self.assertTrue(receipt.get("EffectiveDone"))
+
+            assert_st = run_py(
+                TXN_PY,
+                "assert-state",
+                "--task",
+                "WP-12A",
+                "--expected",
+                "DONE",
+                "--transactions",
+                tmp,
+            )
+            self.assertEqual(assert_st.returncode, 0, msg=assert_st.stdout + assert_st.stderr)
+
+    def test_verify_done_local_partial_still_fail_closed(self) -> None:
+        """--local-partial lists missing gates and never sets EffectiveDone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="PLUGIN_COMMITTED")
+            ledger = self._write_bootstrap_ledger(Path(tmp), pushed=False)
+
+            proc = run_py(
+                TXN_PY,
+                "verify-done",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--bootstrap-ledger",
+                str(ledger),
+                "--local-partial",
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            payload = parse_json_stdout(proc)
+            self.assertEqual(payload.get("failureReason"), "MISSING_GATE")
+            self.assertTrue(payload.get("localPartial"))
+            self.assertIs(payload.get("EffectiveDone"), False)
+            missing = payload.get("missing") or []
+            self.assertIn("BOOTSTRAP_PUSHED", missing)
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(receipt.get("state"), "DONE")
+            self.assertFalse(receipt.get("EffectiveDone"))
+
+    def test_record_mineradio_evidence_from_evidence_sealed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="EVIDENCE_SEALED")
+            # Clear plugin commit so prepare-closure later would fail; evidence path alone OK.
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            # keep pluginCommit for seal facts; state EVIDENCE_SEALED is allowed prereq
+            txn_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            manifest = self._write_sealed_manifest(Path(tmp))
+            rec = run_py(
+                TXN_PY,
+                "record-mineradio-evidence",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--manifest-path",
+                str(manifest),
+                "--evidence-sha",
+                self.FAKE_EVIDENCE_SHA,
+                "--commit-sha",
+                self.FAKE_EVIDENCE_SHA,
+            )
+            self.assertEqual(rec.returncode, 0, msg=rec.stdout + rec.stderr)
+            payload = parse_json_stdout(rec)
+            self.assertEqual(payload.get("state"), "MINERADIO_EVIDENCE_COMMITTED")
+            self.assertIs(payload.get("EffectiveDone"), False)
+            self.assertTrue(payload.get("inventorySealed"))
+
+    def test_bootstrap_missing_blocks_verify_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            txn_path = self._init_local(tmp)
+            self._stamp_phases_and_plugin(txn_path, state="MINERADIO_CLOSURE_PUSHED")
+            receipt = json.loads(txn_path.read_text(encoding="utf-8"))
+            receipt["mineradioEvidence"] = {
+                "manifestPath": "/x",
+                "commitSha": self.FAKE_EVIDENCE_SHA,
+                "inventorySealed": True,
+            }
+            receipt["mineradioEvidencePush"] = {"remoteSha": self.FAKE_EVIDENCE_SHA}
+            receipt["closureCommit"] = {"commitSha": self.FAKE_CLOSURE_SHA}
+            receipt["closurePush"] = {"remoteSha": self.FAKE_CLOSURE_SHA}
+            txn_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            missing_ledger = Path(tmp) / "no-such-bootstrap.json"
+            proc = run_py(
+                TXN_PY,
+                "verify-done",
+                "--task",
+                "WP-12A",
+                "--transactions",
+                tmp,
+                "--bootstrap-ledger",
+                str(missing_ledger),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            payload = parse_json_stdout(proc)
+            self.assertEqual(payload.get("failureReason"), "MISSING_GATE")
+            self.assertIn("BOOTSTRAP_PUSHED", payload.get("missing") or [])
+            self.assertIs(payload.get("EffectiveDone"), False)
+
+
 if __name__ == "__main__":
     unittest.main()
