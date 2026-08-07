@@ -4,10 +4,19 @@
 Usage:
   seal-wp12-evidence.py --raw PATH --out PATH [--schema PATH]
                         [--allow-stub] [--require-official-sha]
+                        [--official-sha HEX]
 
 Validates raw collect output has required inventory keys; writes sealed
 manifest. Task EffectiveDone is NEVER claimed from inventory seal alone
-(verify-done only). inventorySealed=true when v1 inventory is complete.
+(verify-done only).
+
+Supports:
+  - WP-12A runtime-inventory (wp12a-manifest-map/v1): inventorySealed when
+    manifest/dex/resources/authorities/permissions shapes are complete.
+  - WP-12B native-closure / native-jni (schemaVersion startswith
+    wp12b-native): inventorySealed when arm64-v8a has ≥1 lib, failClosed is
+    ok (or legacy flags not triggered), and --require-official-sha matches
+    when set. Does not require WP-12A inventory keys.
 """
 
 from __future__ import annotations
@@ -24,7 +33,17 @@ from typing import Any, NoReturn
 EXIT_FAIL = 2
 SEAL_SCHEMA = "wp12-evidence/v1"
 REQUIRED_INVENTORY = ("manifest", "dex", "resources", "authorities", "permissions")
-# Official WE client class used by WP-12A inventory runs.
+# Minimum keys for native-closure inventories (WP-12B).
+REQUIRED_NATIVE_INVENTORY = (
+    "schemaVersion",
+    "packageName",
+    "apkSha256",
+    "abis",
+    "failClosed",
+)
+NATIVE_SCHEMA_PREFIX = "wp12b-native"
+NATIVE_MODES = frozenset({"native-closure", "native-jni"})
+# Official WE client class used by WP-12 inventory runs.
 OFFICIAL_APK_SHA256 = "6982c82745444c5f2eef5a3d8c89ad807360bb5849a133548a6b25d18f4c4cb0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SCHEMA = PLUGIN_ROOT / "runtime-import" / "wp12-evidence.schema.json"
@@ -57,6 +76,58 @@ def _nonempty_dict(value: Any) -> bool:
 
 def _nonempty_list(value: Any) -> bool:
     return isinstance(value, list) and len(value) > 0
+
+
+def is_native_mode(mode: str | None, inventory: dict[str, Any]) -> bool:
+    """Detect WP-12B native-closure from raw.mode or inventory.schemaVersion."""
+    if isinstance(mode, str) and mode in NATIVE_MODES:
+        return True
+    schema_v = inventory.get("schemaVersion")
+    return isinstance(schema_v, str) and schema_v.startswith(NATIVE_SCHEMA_PREFIX)
+
+
+def arm64_lib_count(inventory: dict[str, Any]) -> int:
+    abis = inventory.get("abis")
+    if not isinstance(abis, list):
+        return 0
+    for row in abis:
+        if not isinstance(row, dict):
+            continue
+        if row.get("name") == "arm64-v8a":
+            libs = row.get("libs")
+            return len(libs) if isinstance(libs, list) else 0
+    return 0
+
+
+def fail_closed_is_ok(fail_closed: Any) -> bool:
+    """True when failClosed.ok is true, or legacy flags are not triggered."""
+    if not isinstance(fail_closed, dict):
+        return False
+    if "ok" in fail_closed:
+        return fail_closed.get("ok") is True
+    # Legacy: structured trigger map (summary style) or failures list.
+    if fail_closed.get("anyFailClosedTriggered") is True:
+        return False
+    failures = fail_closed.get("failures")
+    if isinstance(failures, list) and len(failures) > 0:
+        return False
+    for key in (
+        "MISSING_NEEDED",
+        "WRONG_ABI",
+        "DUPLICATE_SONAME",
+        "EMPTY_ARM64",
+        "EMPTY_NATIVE",
+        "emptyArm64",
+        "missingNeeded",
+        "wrongAbi",
+        "duplicateSoname",
+    ):
+        entry = fail_closed.get(key)
+        if entry is True:
+            return False
+        if isinstance(entry, dict) and entry.get("triggered") is True:
+            return False
+    return True
 
 
 def validate_v1_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
@@ -121,30 +192,175 @@ def validate_v1_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
     return errors
 
 
-def inventory_is_complete(inventory: dict[str, Any], *, is_stub: bool) -> bool:
+def validate_native_inventory_shapes(inventory: dict[str, Any]) -> list[str]:
+    """Return shape errors for required native inventory fields (not completeness)."""
+    errors: list[str] = []
+
+    schema_v = inventory.get("schemaVersion")
+    if not isinstance(schema_v, str) or not schema_v.startswith(NATIVE_SCHEMA_PREFIX):
+        errors.append(
+            f"schemaVersion must start with {NATIVE_SCHEMA_PREFIX!r}, got {schema_v!r}"
+        )
+
+    package_name = inventory.get("packageName")
+    if not isinstance(package_name, str) or not package_name.strip():
+        errors.append("packageName must be non-empty string")
+
+    apk_sha = inventory.get("apkSha256")
+    if not isinstance(apk_sha, str) or not apk_sha.strip():
+        errors.append("apkSha256 must be non-empty string")
+    elif len(apk_sha) == 64 and any(c not in "0123456789abcdef" for c in apk_sha.lower()):
+        errors.append("apkSha256 must be hex when 64 chars")
+
+    abis = inventory.get("abis")
+    if not isinstance(abis, list) or len(abis) == 0:
+        errors.append("abis must be non-empty array")
+    else:
+        for i, row in enumerate(abis):
+            if not isinstance(row, dict):
+                errors.append(f"abis[{i}] must be object")
+                continue
+            name = row.get("name")
+            libs = row.get("libs")
+            if not isinstance(name, str) or not name:
+                errors.append(f"abis[{i}].name missing")
+            if not isinstance(libs, list):
+                errors.append(f"abis[{i}].libs must be array")
+                continue
+            for j, lib in enumerate(libs):
+                if not isinstance(lib, dict):
+                    errors.append(f"abis[{i}].libs[{j}] must be object")
+                    continue
+                if not lib.get("name"):
+                    errors.append(f"abis[{i}].libs[{j}].name missing")
+
+    fail_closed = inventory.get("failClosed")
+    if not isinstance(fail_closed, dict):
+        errors.append("failClosed must be object")
+
+    # Optional schema fields: validate type when present.
+    jni = inventory.get("jniLoadLibs")
+    if jni is not None and not isinstance(jni, list):
+        errors.append("jniLoadLibs must be array when present")
+
+    closure = inventory.get("closure")
+    if closure is not None:
+        if not isinstance(closure, dict):
+            errors.append("closure must be object when present")
+        else:
+            for key in ("missingNeeded", "wrongAbi", "duplicateSoname", "systemNeeded"):
+                if key in closure and not isinstance(closure.get(key), list):
+                    errors.append(f"closure.{key} must be array")
+
+    return errors
+
+
+def inventory_is_complete(
+    inventory: dict[str, Any],
+    *,
+    is_stub: bool,
+    native: bool,
+    require_official_sha: bool,
+    expected_official_sha: str,
+    apk_sha: str | None,
+) -> bool:
+    """inventorySealed criteria. EffectiveDone is never derived here."""
     if is_stub:
         return False
+    if native:
+        missing = [k for k in REQUIRED_NATIVE_INVENTORY if k not in inventory]
+        if missing:
+            return False
+        if validate_native_inventory_shapes(inventory):
+            return False
+        if arm64_lib_count(inventory) < 1:
+            return False
+        if not fail_closed_is_ok(inventory.get("failClosed")):
+            return False
+        if require_official_sha:
+            expected = (expected_official_sha or OFFICIAL_APK_SHA256).lower()
+            if not apk_sha or apk_sha.lower() != expected:
+                return False
+        return True
     missing = [k for k in REQUIRED_INVENTORY if k not in inventory]
     if missing:
         return False
     return len(validate_v1_inventory_shapes(inventory)) == 0
 
 
-def slice_inventory_for_seal(inventory: dict[str, Any]) -> dict[str, Any]:
-    """Preserve v1 shapes (authorities array; permissions declared/uses)."""
-    authorities = inventory.get("authorities")
-    if authorities is None:
-        authorities = []
-    permissions = inventory.get("permissions")
-    if not isinstance(permissions, dict):
-        permissions = {}
-    return {
-        "manifest": inventory.get("manifest") if isinstance(inventory.get("manifest"), dict) else {},
-        "dex": inventory.get("dex") if isinstance(inventory.get("dex"), dict) else {},
-        "resources": inventory.get("resources") if isinstance(inventory.get("resources"), dict) else {},
-        "authorities": authorities,
-        "permissions": permissions,
+def slice_inventory_for_seal(inventory: dict[str, Any], *, native: bool) -> dict[str, Any]:
+    """Preserve inventory shapes for sealed blob (no APK/SO bytes)."""
+    if not native:
+        authorities = inventory.get("authorities")
+        if authorities is None:
+            authorities = []
+        permissions = inventory.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+        return {
+            "manifest": inventory.get("manifest") if isinstance(inventory.get("manifest"), dict) else {},
+            "dex": inventory.get("dex") if isinstance(inventory.get("dex"), dict) else {},
+            "resources": inventory.get("resources") if isinstance(inventory.get("resources"), dict) else {},
+            "authorities": authorities,
+            "permissions": permissions,
+        }
+
+    abis_out: list[dict[str, Any]] = []
+    total_so = 0
+    for row in inventory.get("abis") or []:
+        if not isinstance(row, dict):
+            continue
+        libs_out: list[dict[str, Any]] = []
+        for lib in row.get("libs") or []:
+            if not isinstance(lib, dict):
+                continue
+            entry = {
+                "name": lib.get("name"),
+                "path": lib.get("path"),
+                "sha256": lib.get("sha256"),
+                "sizeBytes": lib.get("sizeBytes"),
+                "soname": lib.get("soname"),
+                "needed": list(lib.get("needed") or []) if isinstance(lib.get("needed"), list) else [],
+                "elfClass": lib.get("elfClass"),
+                "elfMachine": lib.get("elfMachine"),
+            }
+            libs_out.append(entry)
+            total_so += 1
+        abis_out.append({"name": row.get("name"), "libs": libs_out, "libCount": len(libs_out)})
+
+    closure_in = inventory.get("closure") if isinstance(inventory.get("closure"), dict) else {}
+    sliced: dict[str, Any] = {
+        "schemaVersion": inventory.get("schemaVersion"),
+        "packageName": inventory.get("packageName"),
+        "apkSha256": inventory.get("apkSha256"),
+        "abis": abis_out,
+        "failClosed": inventory.get("failClosed")
+        if isinstance(inventory.get("failClosed"), dict)
+        else {"ok": False, "failures": []},
+        "counts": {
+            "totalSo": total_so,
+            "abiCount": len(abis_out),
+            "arm64LibCount": next(
+                (r["libCount"] for r in abis_out if r.get("name") == "arm64-v8a"),
+                0,
+            ),
+        },
     }
+    if inventory.get("versionCode") is not None:
+        sliced["versionCode"] = inventory.get("versionCode")
+    if inventory.get("versionName") is not None:
+        sliced["versionName"] = inventory.get("versionName")
+    if isinstance(inventory.get("jniLoadLibs"), list):
+        sliced["jniLoadLibs"] = list(inventory.get("jniLoadLibs") or [])
+        sliced["counts"]["jniLoadCount"] = len(sliced["jniLoadLibs"])
+    if closure_in:
+        sliced["closure"] = {
+            "missingNeeded": list(closure_in.get("missingNeeded") or []),
+            "wrongAbi": list(closure_in.get("wrongAbi") or []),
+            "duplicateSoname": list(closure_in.get("duplicateSoname") or []),
+            "systemNeeded": list(closure_in.get("systemNeeded") or []),
+        }
+    return sliced
 
 
 def resolve_apk_sha(raw: dict[str, Any], inventory: dict[str, Any]) -> str | None:
@@ -208,12 +424,22 @@ def main(argv: list[str]) -> int:
     if not isinstance(inventory, dict):
         emit_failure("MISSING_INPUT", "raw.inventory missing or not object")
 
-    missing_keys = [k for k in REQUIRED_INVENTORY if k not in inventory]
-    if missing_keys:
-        emit_failure(
-            "INVENTORY_INCOMPLETE",
-            f"inventory missing keys: {','.join(missing_keys)}",
-        )
+    native = is_native_mode(raw.get("mode"), inventory)
+
+    if native:
+        missing_keys = [k for k in REQUIRED_NATIVE_INVENTORY if k not in inventory]
+        if missing_keys:
+            emit_failure(
+                "INVENTORY_INCOMPLETE",
+                f"native inventory missing keys: {','.join(missing_keys)}",
+            )
+    else:
+        missing_keys = [k for k in REQUIRED_INVENTORY if k not in inventory]
+        if missing_keys:
+            emit_failure(
+                "INVENTORY_INCOMPLETE",
+                f"inventory missing keys: {','.join(missing_keys)}",
+            )
 
     is_stub = inventory.get("status") == "STUB_PENDING_IMPORT"
     if is_stub and not args.allow_stub:
@@ -222,14 +448,19 @@ def main(argv: list[str]) -> int:
             "refusing to seal STUB_PENDING_IMPORT without --allow-stub",
         )
 
-    shape_errors = validate_v1_inventory_shapes(inventory) if not is_stub else []
-    if shape_errors and not is_stub:
-        emit_failure(
-            "INVENTORY_SHAPE_INVALID",
-            "; ".join(shape_errors),
+    if not is_stub:
+        shape_errors = (
+            validate_native_inventory_shapes(inventory)
+            if native
+            else validate_v1_inventory_shapes(inventory)
         )
+        if shape_errors:
+            emit_failure(
+                "INVENTORY_SHAPE_INVALID",
+                "; ".join(shape_errors),
+            )
 
-    # failClosed.ok must not be false when present
+    # failClosed.ok must not be false when present (v1 ok field).
     fail_closed = inventory.get("failClosed")
     if isinstance(fail_closed, dict) and fail_closed.get("ok") is False:
         emit_failure(
@@ -252,21 +483,29 @@ def main(argv: list[str]) -> int:
                 " --require-official-sha needs officialApkSha256 or inventory.apkSha256",
             )
 
-    inventory_sealed = inventory_is_complete(inventory, is_stub=is_stub)
+    inventory_sealed = inventory_is_complete(
+        inventory,
+        is_stub=is_stub,
+        native=native,
+        require_official_sha=bool(args.require_official_sha),
+        expected_official_sha=args.official_sha or OFFICIAL_APK_SHA256,
+        apk_sha=apk_sha,
+    )
     # Task EffectiveDone is verify-done only — never claimed from inventory seal.
     effective_done = False
 
+    default_task = "WP-12B" if native else "WP-12A"
     raw_bytes = raw_path.read_bytes()
     sealed = {
         "schema": SEAL_SCHEMA,
-        "taskId": raw.get("taskId") or "WP-12A",
+        "taskId": raw.get("taskId") or default_task,
         "mode": raw["mode"],
         "transactionId": raw["transactionId"],
         "runUuid": raw["runUuid"],
         "attemptNo": raw["attemptNo"],
         "sealedAt": utc_now_iso(),
         "pluginCommitSha": raw.get("pluginCommitSha"),
-        "inventory": slice_inventory_for_seal(inventory),
+        "inventory": slice_inventory_for_seal(inventory, native=native),
         "hashes": {
             "rawSha256": sha256_bytes(raw_bytes),
         },
@@ -274,10 +513,15 @@ def main(argv: list[str]) -> int:
         "inventorySealed": inventory_sealed,
         "EffectiveDone": effective_done,
         "notes": [
-            "Sealer: inventorySealed reflects complete non-stub v1 inventory.",
+            "Sealer: inventorySealed reflects complete non-stub inventory for mode.",
             "EffectiveDone is always false here; task EffectiveDone is verify-done only.",
         ],
     }
+    if native:
+        sealed["notes"].append(
+            "native-closure seal: no WP-12A keys required; inventorySealed needs "
+            "arm64-v8a libs + failClosed ok (+ official sha when required)."
+        )
     if is_stub:
         sealed["notes"].append("sealed with --allow-stub; inventorySealed=false EffectiveDone=false")
     if apk_sha:
@@ -285,9 +529,10 @@ def main(argv: list[str]) -> int:
     if inventory.get("schemaVersion"):
         sealed["inventorySchemaVersion"] = inventory.get("schemaVersion")
     if isinstance(fail_closed, dict):
+        failures = fail_closed.get("failures")
         sealed["failClosed"] = {
-            "ok": bool(fail_closed.get("ok")),
-            "failureCount": len(fail_closed.get("failures") or []),
+            "ok": fail_closed_is_ok(fail_closed),
+            "failureCount": len(failures) if isinstance(failures, list) else 0,
         }
 
     payload = (json.dumps(sealed, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
@@ -314,6 +559,7 @@ def main(argv: list[str]) -> int:
         stub=is_stub,
         attemptNo=raw["attemptNo"],
         officialApkSha256=apk_sha,
+        native=native,
     )
 
 
