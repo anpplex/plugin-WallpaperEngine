@@ -203,6 +203,14 @@ class EmbeddedSceneVideoTest {
             EmbeddedExperimentalPreview.ALLOWED_INTENT_EXTRAS,
         )
         assertTrue(unknown.isEmpty())
+        assertTrue(
+            EmbeddedExperimentalPreview.EXTRA_MPKG_PATH in
+                EmbeddedExperimentalPreview.ALLOWED_INTENT_EXTRAS,
+        )
+        assertTrue(
+            EmbeddedExperimentalPreview.EXTRA_MPKG_SHA256 in
+                EmbeddedExperimentalPreview.ALLOWED_INTENT_EXTRAS,
+        )
     }
 
     @Test
