@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "wp12c-adapter-contract/v1",
+  "packageName": "com.motif.wallpaperengine",
+  "officialEnginePackage": "io.wallpaperengine.weclient",
+  "embeddedRuntimeDefault": false,
+  "failClosed": {
+    "ok": false,
+    "failures": ["UNKNOWN_METHOD"]
+  },
+  "checks": {
+    "unknownMethodRejected": true,
+    "appendedArgsRejected": true,
+    "fallbackMasqueradeRejected": true,
+    "defaultUsesOfficial": true
+  }
+}
